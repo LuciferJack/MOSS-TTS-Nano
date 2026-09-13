@@ -7,6 +7,8 @@ from typing import Any, Dict, Iterable, List, Optional
 import torch
 from torch.utils.data import Dataset
 
+from finetuning.eos_calibration import is_calibration_record, validate_calibration_record
+
 
 USER_ROLE_PREFIX = "user\n"
 USER_TEMPLATE_REFERENCE_PREFIX = "<user_inst>\n- Reference(s):\n"
@@ -99,12 +101,18 @@ class MossTTSNanoSFTDataset(Dataset):
     def _build_example(self, record: Dict[str, Any], *, index: int) -> Dict[str, Any]:
         if "text" not in record or not str(record["text"]).strip():
             raise ValueError(f"Record {index} is missing a non-empty `text` field.")
-        if "audio_codes" not in record:
+        calibration = is_calibration_record(record)
+        if calibration:
+            validate_calibration_record(record)
+            codes_field = "self_generated_prefix_codes"
+        elif "audio_codes" not in record:
             raise ValueError(f"Record {index} is missing `audio_codes`. Run prepare_data.py first.")
+        else:
+            codes_field = "audio_codes"
 
         target_codes = self._normalize_codes_to_model_width(
-            normalize_audio_codes(record["audio_codes"], "audio_codes"),
-            field_name="audio_codes",
+            normalize_audio_codes(record[codes_field], codes_field),
+            field_name=codes_field,
             index=index,
         )
         reference_codes = self._resolve_reference_codes(record, index=index)
@@ -141,6 +149,7 @@ class MossTTSNanoSFTDataset(Dataset):
             "full_input_ids": full_sequence,
             "seq_len": torch.tensor(seq_len, dtype=torch.long),
             "prompt_length": torch.tensor(prompt_length, dtype=torch.long),
+            "text_only_eos_calibration": calibration,
         }
 
     def collate_fn(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -172,6 +181,11 @@ class MossTTSNanoSFTDataset(Dataset):
             labels[:, :, 1:] == int(self.model_config.audio_pad_token_id),
             -100,
         )
+        for batch_index, item in enumerate(batch):
+            if item.get("text_only_eos_calibration"):
+                # Generated codec rows are conditioning context only. Never
+                # expose them to any acoustic/VQ objective, even accidentally.
+                labels[batch_index, :, 1:] = -100
 
         return {
             "sample_ids": [str(item["sample_id"]) for item in batch],

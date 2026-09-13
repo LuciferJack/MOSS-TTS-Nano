@@ -25,6 +25,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from finetuning.common import format_duration, format_timestamp, load_jsonl_spec
 from finetuning.dataset import MossTTSNanoSFTDataset, stable_sample_id
+from finetuning.eos_calibration import validate_calibration_records
 from finetuning.protected_gradient import project_teacher_gradient
 
 DEFAULT_MODEL_PATH = REPO_ROOT / "models" / "MOSS-TTS-Nano"
@@ -321,6 +322,18 @@ def resolve_objective_loss_weights(
     teacher_weights = parse_channelwise_loss_weight(args.channelwise_loss_weight, n_heads)
     protector_weights = parse_channelwise_loss_weight(args.protect_channelwise_loss_weight, n_heads)
     return teacher_weights, protector_weights
+
+
+def validate_calibration_objective(
+    records: List[Dict[str, Any]], *, eos_loss_mode: str, channelwise_loss_weight: List[float]
+) -> None:
+    calibration = validate_calibration_records(records)
+    if not calibration:
+        return
+    if eos_loss_mode != "sequence_balanced":
+        raise ValueError("Self-generated EOS calibration requires sequence_balanced EOS loss.")
+    if channelwise_loss_weight[0] != 1 or any(weight != 0 for weight in channelwise_loss_weight[1:]):
+        raise ValueError("Self-generated EOS calibration requires channel weights 1,0 (zero VQ loss).")
 
 
 def build_optimizer(model, args: argparse.Namespace) -> AdamW:
@@ -780,6 +793,10 @@ def main() -> None:
     channelwise_loss_weight, protect_channelwise_loss_weight = resolve_objective_loss_weights(
         args,
         int(model.config.n_vq) + 1,
+    )
+    validate_calibration_objective(
+        records, eos_loss_mode=args.eos_loss_mode,
+        channelwise_loss_weight=channelwise_loss_weight,
     )
 
     lr_scheduler = get_scheduler(
