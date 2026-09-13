@@ -100,6 +100,10 @@ def parse_args() -> argparse.Namespace:
             "The total audio weight will be evenly split across all audio heads."
         ),
     )
+    parser.add_argument(
+        "--protect-channelwise-loss-weight", type=str, default="0,1",
+        help="Loss weights for the PCGrad preservation batch; defaults to acoustic-only protection.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--lora-rank", type=int, default=0, help="Enable LoRA when greater than zero.")
     parser.add_argument("--lora-alpha", type=int, default=16)
@@ -266,6 +270,20 @@ def parse_channelwise_loss_weight(spec: str, n_heads: int) -> List[float]:
     if sum(resolved) <= 0:
         raise ValueError("`channelwise_loss_weight` must sum to a positive value.")
     return resolved
+
+
+def resolve_objective_loss_weights(
+    args: argparse.Namespace,
+    n_heads: int,
+) -> tuple[List[float], List[float]]:
+    """Resolve teacher and protector objectives independently.
+
+    Keeping this mapping in one tested helper prevents the preservation batch
+    from accidentally inheriting the teacher's text/EOS-only objective.
+    """
+    teacher_weights = parse_channelwise_loss_weight(args.channelwise_loss_weight, n_heads)
+    protector_weights = parse_channelwise_loss_weight(args.protect_channelwise_loss_weight, n_heads)
+    return teacher_weights, protector_weights
 
 
 def build_optimizer(model, args: argparse.Namespace) -> AdamW:
@@ -589,8 +607,8 @@ def main() -> None:
     optimizer_steps_per_epoch = math.ceil(micro_batches_per_epoch / args.gradient_accumulation_steps)
     max_train_steps = args.max_train_steps or (args.num_epochs * optimizer_steps_per_epoch)
     warmup_steps = resolve_warmup_steps(args, max_train_steps)
-    channelwise_loss_weight = parse_channelwise_loss_weight(
-        args.channelwise_loss_weight,
+    channelwise_loss_weight, protect_channelwise_loss_weight = resolve_objective_loss_weights(
+        args,
         int(model.config.n_vq) + 1,
     )
 
@@ -617,6 +635,7 @@ def main() -> None:
     train_args_to_save = vars(args).copy()
     train_args_to_save["resolved_warmup_steps"] = warmup_steps
     train_args_to_save["resolved_channelwise_loss_weight"] = channelwise_loss_weight
+    train_args_to_save["resolved_protect_channelwise_loss_weight"] = protect_channelwise_loss_weight
     train_args_to_save["global_batch_size"] = global_batch_size
     train_args_to_save["records_paths"] = [str(path.resolve()) for path in records_paths]
     train_args_to_save["protect_records_paths"] = [str(path.resolve()) for path in protect_records_paths]
@@ -673,7 +692,7 @@ def main() -> None:
                         input_ids=protect_batch["input_ids"],
                         attention_mask=protect_batch["attention_mask"],
                         labels=protect_batch["labels"],
-                        channelwise_loss_weight=channelwise_loss_weight,
+                        channelwise_loss_weight=protect_channelwise_loss_weight,
                     )
                     projection_report = pcgrad_backward(
                         accelerator=accelerator,

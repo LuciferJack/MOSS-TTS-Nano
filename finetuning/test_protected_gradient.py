@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import unittest
+from argparse import Namespace
 
 import torch
 
 from finetuning.protected_gradient import project_teacher_gradient
-from finetuning.sft import pcgrad_backward
+from finetuning.sft import pcgrad_backward, resolve_objective_loss_weights
 
 
 class _Accelerator:
@@ -15,6 +16,17 @@ class _Accelerator:
 
 
 class ProtectedGradientTests(unittest.TestCase):
+    def test_teacher_and_protector_use_separate_channel_objectives(self):
+        teacher, protector = resolve_objective_loss_weights(
+            Namespace(
+                channelwise_loss_weight="1,0",
+                protect_channelwise_loss_weight="0,1",
+            ),
+            n_heads=9,
+        )
+        self.assertEqual(teacher, [1.0] + [0.0] * 8)
+        self.assertEqual(protector, [0.0] + [0.125] * 8)
+
     def test_projects_conflicts_and_preserves_compatible_component(self):
         teacher = torch.tensor([-2.0, -1.0, 3.0])
         protectors = [torch.tensor([1.0, 0.0, 0.0]), torch.tensor([0.0, 1.0, 0.0])]
