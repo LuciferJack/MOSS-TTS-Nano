@@ -26,7 +26,7 @@ if str(REPO_ROOT) not in sys.path:
 from finetuning.common import format_duration, format_timestamp, load_jsonl_spec
 from finetuning.dataset import MossTTSNanoSFTDataset, stable_sample_id
 from finetuning.eos_calibration import validate_calibration_records
-from finetuning.protected_gradient import project_teacher_gradient
+from finetuning.protected_gradient import is_feasible_dot, project_teacher_gradient
 
 DEFAULT_MODEL_PATH = REPO_ROOT / "models" / "MOSS-TTS-Nano"
 DEFAULT_CODEC_PATH = REPO_ROOT / "models" / "MOSS-Audio-Tokenizer-Nano"
@@ -1071,6 +1071,11 @@ def main() -> None:
                                     "original_minimum_dot": projection_report.original_minimum_dot,
                                     "minimum_dot": projection_report.minimum_dot,
                                     "retained_norm_ratio": projection_report.retained_norm_ratio,
+                                    "feasibility_tolerance": projection_report.feasibility_tolerance,
+                                    "constraint_violation_count": sum(
+                                        not is_feasible_dot(dot, tolerance=projection_report.feasibility_tolerance)
+                                        for dot in projection_report.dots
+                                    ),
                                     "original_constraint_dots": list(projection_report.original_dots),
                                     "constraint_dots": list(projection_report.dots),
                                     "acoustic_original_dots": list(projection_report.original_dots[:len(acoustic_batches)]),

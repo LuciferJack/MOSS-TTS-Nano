@@ -48,3 +48,13 @@ masks every VQ label on calibration rows. Generated codes therefore remain
 conditioning context only, while ordinary/acronym replay rows retain normal VQ
 labels. Missing/mismatched provenance, malformed codes, duplicate IDs and EOS
 truncation all fail closed.
+
+## Dual-protection feasibility
+
+Dual PCGrad treats each acoustic and behavior protector as an independent
+constraint. Gradients and dot products are evaluated in FP32. The formal
+machine criterion is `dot >= -1e-7`, not a string-level `dot >= 0`; tiny
+negative values inside this absolute tolerance are floating-point residuals.
+Diagnostics record `feasibility_tolerance` and `constraint_violation_count`,
+and the run fails if any dot is below the recorded tolerance or if less than
+5% of the teacher-gradient norm remains.

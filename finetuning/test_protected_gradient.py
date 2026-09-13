@@ -5,7 +5,9 @@ from argparse import Namespace
 
 import torch
 
-from finetuning.protected_gradient import project_teacher_gradient
+from finetuning.protected_gradient import (
+    PCGRAD_FEASIBILITY_TOLERANCE, is_feasible_dot, project_teacher_gradient,
+)
 from finetuning.sft import (
     pcgrad_backward, resolve_objective_loss_weights, validate_behavior_protection,
 )
@@ -34,7 +36,7 @@ class ProtectedGradientTests(unittest.TestCase):
         teacher = torch.tensor([-2.0, -1.0, 3.0])
         protectors = [torch.tensor([1.0, 0.0, 0.0]), torch.tensor([0.0, 1.0, 0.0])]
         projected, report = project_teacher_gradient(teacher, protectors)
-        self.assertTrue(all(float(projected.dot(item)) >= 0 for item in protectors))
+        self.assertTrue(all(is_feasible_dot(float(projected.dot(item))) for item in protectors))
         self.assertAlmostEqual(float(projected[2]), 3.0)
         self.assertGreater(report.retained_norm_ratio, 0.5)
 
@@ -62,7 +64,7 @@ class ProtectedGradientTests(unittest.TestCase):
             teacher_loss=teacher_loss, protector_loss=protector_loss,
         )
         self.assertTrue(torch.allclose(parameter.grad, torch.tensor([0.0, 1.0])))
-        self.assertGreaterEqual(report.minimum_dot, 0.0)
+        self.assertTrue(is_feasible_dot(report.minimum_dot))
 
     def test_training_backward_satisfies_acoustic_and_behavior_constraints(self):
         parameter = torch.nn.Parameter(torch.tensor([0.0, 0.0, 0.0]))
@@ -74,7 +76,7 @@ class ProtectedGradientTests(unittest.TestCase):
         )
         self.assertTrue(torch.allclose(parameter.grad, torch.tensor([0.0, 0.0, 1.0])))
         self.assertEqual(len(report.dots), 2)
-        self.assertTrue(all(dot >= 0 for dot in report.dots))
+        self.assertTrue(all(is_feasible_dot(dot) for dot in report.dots))
 
     def test_factory_constraints_are_built_and_consumed_sequentially(self):
         parameter = torch.nn.Parameter(torch.tensor([0.0, 0.0, 0.0]))
@@ -91,8 +93,12 @@ class ProtectedGradientTests(unittest.TestCase):
             protector_loss_factories=[factory(0), factory(1)],
         )
         self.assertEqual(calls, [0, 1])
-        self.assertTrue(all(dot >= 0 for dot in report.dots))
+        self.assertTrue(all(is_feasible_dot(dot) for dot in report.dots))
         self.assertTrue(torch.allclose(parameter.grad, torch.tensor([0.0, 0.0, 1.0])))
+
+    def test_fp32_residual_uses_the_formal_absolute_tolerance(self):
+        self.assertTrue(is_feasible_dot(-7.73e-8))
+        self.assertFalse(is_feasible_dot(-1.01 * PCGRAD_FEASIBILITY_TOLERANCE))
 
     def test_dual_protection_manifest_is_fail_closed(self):
         train = []

@@ -6,6 +6,14 @@ from dataclasses import dataclass
 import torch
 
 
+PCGRAD_FEASIBILITY_TOLERANCE = 1e-7
+
+
+def is_feasible_dot(value: float, *, tolerance: float = PCGRAD_FEASIBILITY_TOLERANCE) -> bool:
+    """Return the formal FP32 PCGrad feasibility decision."""
+    return value >= -tolerance
+
+
 @dataclass(frozen=True)
 class ProjectionReport:
     iterations: int
@@ -14,13 +22,14 @@ class ProjectionReport:
     retained_norm_ratio: float
     original_dots: tuple[float, ...] = ()
     dots: tuple[float, ...] = ()
+    feasibility_tolerance: float = PCGRAD_FEASIBILITY_TOLERANCE
 
 
 def project_teacher_gradient(
     teacher: torch.Tensor,
     protectors: list[torch.Tensor],
     *,
-    tolerance: float = 1e-7,
+    tolerance: float = PCGRAD_FEASIBILITY_TOLERANCE,
     max_iterations: int = 100,
     minimum_retained_ratio: float = 0.05,
 ) -> tuple[torch.Tensor, ProjectionReport]:
@@ -58,7 +67,7 @@ def project_teacher_gradient(
 
     dots = torch.stack([projected.dot(item) for item in protectors])
     minimum_dot = float(dots.min())
-    if minimum_dot < -tolerance:
+    if not is_feasible_dot(minimum_dot, tolerance=tolerance):
         raise RuntimeError(f"projection left a negative preservation dot product: {minimum_dot}")
     retained_ratio = float(projected.norm() / original_norm)
     if retained_ratio < minimum_retained_ratio:
@@ -67,4 +76,5 @@ def project_teacher_gradient(
         iterations, original_minimum_dot, minimum_dot, retained_ratio,
         tuple(float(teacher.dot(item)) for item in protectors),
         tuple(float(projected.dot(item)) for item in protectors),
+        tolerance,
     )
