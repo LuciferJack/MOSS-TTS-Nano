@@ -25,6 +25,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from finetuning.common import format_duration, format_timestamp, load_jsonl_spec
 from finetuning.dataset import MossTTSNanoSFTDataset
+from finetuning.protected_gradient import project_teacher_gradient
 
 DEFAULT_MODEL_PATH = REPO_ROOT / "models" / "MOSS-TTS-Nano"
 DEFAULT_CODEC_PATH = REPO_ROOT / "models" / "MOSS-Audio-Tokenizer-Nano"
@@ -75,9 +76,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-train-steps", type=int, default=None)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--logging-steps", type=int, default=10)
+    parser.add_argument(
+        "--diagnostics-jsonl",
+        type=str,
+        default="",
+        help="Optional JSONL path for per-channel losses and pre-clip module gradient norms.",
+    )
     parser.add_argument("--save-every-epochs", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--mixed-precision", type=str, default="bf16", choices=["no", "fp16", "bf16"])
+    parser.add_argument(
+        "--allow-cpu",
+        action="store_true",
+        help="Allow bounded CPU diagnostics. Full training remains CUDA-first.",
+    )
     parser.add_argument("--attn-implementation", type=str, default="auto")
     parser.add_argument(
         "--channelwise-loss-weight",
@@ -89,6 +101,21 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--lora-rank", type=int, default=0, help="Enable LoRA when greater than zero.")
+    parser.add_argument("--lora-alpha", type=int, default=16)
+    parser.add_argument("--lora-dropout", type=float, default=0.05)
+    parser.add_argument(
+        "--lora-target-modules",
+        default=r"^transformer\.h\.\d+\.(attn\.(c_attn|c_proj)|mlp\.(c_fc|c_proj))$",
+        help="PEFT target-module regex. Defaults to the 12-layer global AR transformer only.",
+    )
+    parser.add_argument(
+        "--lora-modules-to-save",
+        default="",
+        help="Comma-separated non-LoRA modules to train and store with the adapter.",
+    )
+    parser.add_argument("--pcgrad", action="store_true", help="Project teacher gradients against a preservation batch.")
+    parser.add_argument("--protect-jsonl", type=str, default="", help="Held-out preservation JSONL required by --pcgrad.")
     return parser.parse_args()
 
 
@@ -119,6 +146,55 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("`save_every_epochs` must be > 0.")
     if args.num_workers < 0:
         raise ValueError("`num_workers` must be >= 0.")
+    if args.lora_rank < 0:
+        raise ValueError("`lora_rank` must be >= 0.")
+    if args.lora_alpha <= 0:
+        raise ValueError("`lora_alpha` must be > 0.")
+    if not 0.0 <= args.lora_dropout < 1.0:
+        raise ValueError("`lora_dropout` must be in [0, 1).")
+    if args.pcgrad and not args.protect_jsonl:
+        raise ValueError("`--protect-jsonl` is required with `--pcgrad`.")
+    if args.pcgrad and args.gradient_accumulation_steps != 1:
+        raise ValueError("PCGrad currently requires `--gradient-accumulation-steps 1`.")
+
+
+def pcgrad_backward(*, accelerator, model, teacher_loss: torch.Tensor, protector_loss: torch.Tensor):
+    """Backprop both objectives and replace grads with protector + projected teacher."""
+    trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    optimizer_grads = [None if p.grad is None else p.grad.detach().clone() for p in trainable]
+    for parameter in trainable:
+        parameter.grad = None
+    accelerator.backward(protector_loss)
+    protector_grads = [None if p.grad is None else p.grad.detach().clone() for p in trainable]
+    for parameter in trainable:
+        parameter.grad = None
+    accelerator.backward(teacher_loss)
+    teacher_grads = [None if p.grad is None else p.grad.detach().clone() for p in trainable]
+
+    active = [i for i, (teacher, protector) in enumerate(zip(teacher_grads, protector_grads))
+              if teacher is not None and protector is not None]
+    if not active:
+        raise RuntimeError("PCGrad found no parameters shared by teacher and protector losses.")
+    teacher_flat = torch.cat([teacher_grads[i].float().reshape(-1) for i in active])
+    protector_flat = torch.cat([protector_grads[i].float().reshape(-1) for i in active])
+    projected, report = project_teacher_gradient(teacher_flat, [protector_flat])
+    active_set = set(active)
+    offset = 0
+    for i, parameter in enumerate(trainable):
+        previous = optimizer_grads[i]
+        teacher, protector = teacher_grads[i], protector_grads[i]
+        if i in active_set:
+            count = teacher.numel()
+            resolved = protector.float() + projected[offset:offset + count].reshape_as(teacher)
+            offset += count
+            parameter.grad = resolved.to(dtype=parameter.dtype)
+        elif protector is not None:
+            parameter.grad = protector
+        elif teacher is not None:
+            parameter.grad = teacher
+        if previous is not None:
+            parameter.grad = previous if parameter.grad is None else parameter.grad + previous
+    return report
 
 
 def configure_torch_backends() -> None:
@@ -216,7 +292,8 @@ def compute_supervised_loss(
     attention_mask: torch.BoolTensor,
     labels: torch.LongTensor,
     channelwise_loss_weight: List[float],
-) -> torch.Tensor:
+    return_breakdown: bool = False,
+):
     outputs = model(
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -276,10 +353,18 @@ def compute_supervised_loss(
 
     total_loss = torch.zeros((), device=flat_hidden.device, dtype=torch.float32)
     total_weight = 0.0
+    # Fixed keys are required for distributed diagnostics: separate ranks may
+    # see batches where a padded channel has no valid targets, but every rank
+    # must execute the same number and order of gather collectives.
+    channel_losses: Dict[str, torch.Tensor] = {
+        name: torch.full((), float("nan"), device=flat_hidden.device, dtype=torch.float32)
+        for name in ("text", *(f"vq{index}" for index in range(n_vq)))
+    }
 
     text_logits = base_model.text_lm_head(local_hidden_states[:, 0, :])
     if (text_targets != -100).any():
         text_loss = F.cross_entropy(text_logits.float(), text_targets, ignore_index=-100)
+        channel_losses["text"] = text_loss.detach().float()
         total_loss = total_loss + float(channelwise_loss_weight[0]) * text_loss.float()
         total_weight += float(channelwise_loss_weight[0])
 
@@ -289,12 +374,51 @@ def compute_supervised_loss(
             continue
         channel_logits = base_model.audio_lm_heads[channel_index](local_hidden_states[:, channel_index + 1, :])
         channel_loss = F.cross_entropy(channel_logits.float(), channel_targets, ignore_index=-100)
+        channel_losses[f"vq{channel_index}"] = channel_loss.detach().float()
         total_loss = total_loss + float(channelwise_loss_weight[channel_index + 1]) * channel_loss.float()
         total_weight += float(channelwise_loss_weight[channel_index + 1])
 
     if total_weight <= 0:
         raise RuntimeError("All labels are ignored; check dataset packing and max_length.")
-    return total_loss / total_weight
+    resolved_loss = total_loss / total_weight
+    if return_breakdown:
+        return resolved_loss, channel_losses
+    return resolved_loss
+
+
+def module_gradient_norms(model, *, loss_scale: float = 1.0) -> Dict[str, float]:
+    """Report true pre-clip L2 norms without mutating loss-scaled gradients."""
+    if not math.isfinite(loss_scale) or loss_scale <= 0:
+        raise ValueError(f"loss_scale must be finite and positive, got {loss_scale!r}")
+    groups = {
+        "local_transformer": "local_transformer.",
+        # Output heads are weight-tied. named_parameters() reports each shared
+        # tensor once under the embedding-side name, so group the two roles.
+        "text_embedding_head": "transformer.wte.",
+        "audio_embedding_heads": "audio_embeddings.",
+        "global_transformer": "transformer.",
+    }
+    squared = {name: 0.0 for name in groups}
+    squared["other"] = 0.0
+    base_model = unwrap_training_model(model)
+    for parameter_name, parameter in base_model.named_parameters():
+        if parameter.grad is None:
+            continue
+        # PEFT prefixes names with e.g. base_model.model.; substring matching
+        # keeps the same grouping for full-parameter and adapter training.
+        group = next((name for name, marker in groups.items() if marker in parameter_name), "other")
+        # GradScaler leaves FP16 gradients scaled until clipping/step. Divide
+        # only the diagnostic value so Accelerate remains responsible for the
+        # single in-place unscale operation in its normal optimizer path.
+        norm = parameter.grad.detach().float().norm(2).item() / loss_scale
+        squared[group] += norm * norm
+    return {name: math.sqrt(value) for name, value in squared.items()}
+
+
+def append_diagnostics(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
 
 
 def resolve_asset(model_path: str, filename: str) -> Optional[Path]:
@@ -335,6 +459,19 @@ def save_checkpoint(
 
     output_dir.mkdir(parents=True, exist_ok=True)
     unwrapped_model = unwrap_training_model(model)
+    if hasattr(unwrapped_model, "peft_config"):
+        unwrapped_model.save_pretrained(output_dir, safe_serialization=True)
+        tokenizer.save_pretrained(output_dir)
+        metadata = dict(train_args)
+        metadata["saved_global_step"] = int(global_step)
+        metadata["saved_epoch"] = int(epoch)
+        metadata["saved_at"] = format_timestamp()
+        metadata["checkpoint_dir"] = str(output_dir)
+        metadata["checkpoint_type"] = "lora_adapter"
+        with open(output_dir / "finetune_config.json", "w", encoding="utf-8") as handle:
+            json.dump(metadata, handle, indent=2, ensure_ascii=False)
+        return
+
     unwrapped_model.config.audio_tokenizer_pretrained_name_or_path = str(Path(codec_path).expanduser().resolve())
     unwrapped_model.config.save_pretrained(output_dir)
     state_dict = {
@@ -371,14 +508,18 @@ def main() -> None:
         step_scheduler_with_optimizer=False,
         kwargs_handlers=[ddp_kwargs],
     )
-    if accelerator.device.type != "cuda":
+    if accelerator.device.type != "cuda" and not args.allow_cpu:
         raise EnvironmentError(
-            f"MOSS-TTS-Nano finetuning requires CUDA, but Accelerate resolved device={accelerator.device}."
+            f"MOSS-TTS-Nano finetuning requires CUDA unless --allow-cpu is explicit; "
+            f"Accelerate resolved device={accelerator.device}."
         )
+    if args.pcgrad and accelerator.num_processes != 1:
+        raise EnvironmentError("PCGrad is currently validated only for one CPU process or one GPU.")
 
     model_dtype = resolve_torch_dtype(args.mixed_precision)
     attn_implementation = resolve_attn_implementation(args.attn_implementation, model_dtype)
     records_paths, records = load_jsonl_spec(args.train_jsonl)
+    protect_records_paths, protect_records = (load_jsonl_spec(args.protect_jsonl) if args.pcgrad else ([], []))
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
     if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
@@ -391,6 +532,23 @@ def main() -> None:
     )
     if hasattr(model, "_set_attention_implementation"):
         model._set_attention_implementation(attn_implementation)
+    if args.lora_rank > 0:
+        try:
+            from peft import LoraConfig, get_peft_model
+        except ImportError as exc:
+            raise ImportError("LoRA requires `peft`; install it before using --lora-rank.") from exc
+        modules_to_save = [item.strip() for item in args.lora_modules_to_save.split(",") if item.strip()]
+        model = get_peft_model(
+            model,
+            LoraConfig(
+                r=args.lora_rank,
+                lora_alpha=args.lora_alpha,
+                lora_dropout=args.lora_dropout,
+                target_modules=args.lora_target_modules,
+                modules_to_save=modules_to_save or None,
+                bias="none",
+            ),
+        )
 
     dataset = MossTTSNanoSFTDataset(
         records,
@@ -406,6 +564,22 @@ def main() -> None:
         pin_memory=torch.cuda.is_available(),
         collate_fn=dataset.collate_fn,
     )
+    protect_dataloader = None
+    if args.pcgrad:
+        protect_dataset = MossTTSNanoSFTDataset(
+            protect_records,
+            tokenizer=tokenizer,
+            model_config=model.config,
+            max_length=args.max_length,
+        )
+        protect_dataloader = DataLoader(
+            protect_dataset,
+            batch_size=args.per_device_batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=torch.cuda.is_available(),
+            collate_fn=protect_dataset.collate_fn,
+        )
 
     optimizer = build_optimizer(model, args)
     global_batch_size = (
@@ -426,14 +600,17 @@ def main() -> None:
         num_warmup_steps=warmup_steps,
         num_training_steps=max_train_steps,
     )
-    model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        model,
-        optimizer,
-        train_dataloader,
-        lr_scheduler,
-    )
+    if protect_dataloader is None:
+        model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            model, optimizer, train_dataloader, lr_scheduler,
+        )
+    else:
+        model, optimizer, train_dataloader, protect_dataloader, lr_scheduler = accelerator.prepare(
+            model, optimizer, train_dataloader, protect_dataloader, lr_scheduler,
+        )
 
     output_root = Path(args.output_dir)
+    diagnostics_path = Path(args.diagnostics_jsonl) if args.diagnostics_jsonl else None
     if accelerator.is_main_process:
         output_root.mkdir(parents=True, exist_ok=True)
 
@@ -442,7 +619,12 @@ def main() -> None:
     train_args_to_save["resolved_channelwise_loss_weight"] = channelwise_loss_weight
     train_args_to_save["global_batch_size"] = global_batch_size
     train_args_to_save["records_paths"] = [str(path.resolve()) for path in records_paths]
+    train_args_to_save["protect_records_paths"] = [str(path.resolve()) for path in protect_records_paths]
     train_args_to_save["attn_implementation"] = attn_implementation
+    trainable_parameters = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
+    total_parameters = sum(parameter.numel() for parameter in model.parameters())
+    train_args_to_save["trainable_parameters"] = trainable_parameters
+    train_args_to_save["total_parameters"] = total_parameters
 
     accelerator.print(
         f"[{format_timestamp()}] [sft] loaded_records={len(dataset)} "
@@ -455,25 +637,56 @@ def main() -> None:
         f"warmup_steps={warmup_steps} "
         f"attn={attn_implementation} "
         f"model_dtype={model_dtype}"
+        f" trainable_parameters={trainable_parameters}/{total_parameters} "
+        f"pcgrad={args.pcgrad} protect_records={len(protect_records)}"
     )
 
     global_step = 0
     completed_epochs = 0
     last_log_time = time.perf_counter()
     last_logged_step = 0
+    protect_iterator = iter(protect_dataloader) if protect_dataloader is not None else None
 
     for epoch in range(args.num_epochs):
         model.train()
         for batch in train_dataloader:
             with accelerator.accumulate(model):
-                loss = compute_supervised_loss(
+                loss, channel_losses = compute_supervised_loss(
                     model,
                     input_ids=batch["input_ids"],
                     attention_mask=batch["attention_mask"],
                     labels=batch["labels"],
                     channelwise_loss_weight=channelwise_loss_weight,
+                    return_breakdown=True,
                 )
-                accelerator.backward(loss)
+                projection_report = None
+                if protect_dataloader is None:
+                    accelerator.backward(loss)
+                else:
+                    try:
+                        protect_batch = next(protect_iterator)
+                    except StopIteration:
+                        protect_iterator = iter(protect_dataloader)
+                        protect_batch = next(protect_iterator)
+                    protector_loss = compute_supervised_loss(
+                        model,
+                        input_ids=protect_batch["input_ids"],
+                        attention_mask=protect_batch["attention_mask"],
+                        labels=protect_batch["labels"],
+                        channelwise_loss_weight=channelwise_loss_weight,
+                    )
+                    projection_report = pcgrad_backward(
+                        accelerator=accelerator,
+                        model=model,
+                        teacher_loss=loss,
+                        protector_loss=protector_loss,
+                    )
+
+                gradient_norms = None
+                if accelerator.sync_gradients and diagnostics_path is not None:
+                    scaler = getattr(accelerator, "scaler", None)
+                    loss_scale = float(scaler.get_scale()) if scaler is not None else 1.0
+                    gradient_norms = module_gradient_norms(model, loss_scale=loss_scale)
 
                 if accelerator.sync_gradients and args.max_grad_norm > 0:
                     accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
@@ -508,6 +721,27 @@ def main() -> None:
                         f"samples_per_sec={samples_per_sec:.2f} "
                         f"eta={format_duration(eta_seconds)}"
                     )
+                    if diagnostics_path is not None:
+                        gathered_channels = {}
+                        for name in channel_losses:
+                            gathered = accelerator.gather(channel_losses[name].reshape(1))
+                            finite = gathered[torch.isfinite(gathered)]
+                            gathered_channels[name] = finite.mean().item() if finite.numel() else None
+                        if accelerator.is_main_process:
+                            append_diagnostics(diagnostics_path, {
+                                "epoch": epoch,
+                                "step": global_step,
+                                "loss": logged_loss,
+                                "learning_rate": lr_val,
+                                "channel_loss": gathered_channels,
+                                "gradient_norm_pre_clip": gradient_norms or {},
+                                "pcgrad": None if projection_report is None else {
+                                    "iterations": projection_report.iterations,
+                                    "original_minimum_dot": projection_report.original_minimum_dot,
+                                    "minimum_dot": projection_report.minimum_dot,
+                                    "retained_norm_ratio": projection_report.retained_norm_ratio,
+                                },
+                            })
 
                 if global_step >= max_train_steps:
                     break

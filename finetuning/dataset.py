@@ -197,9 +197,13 @@ class MossTTSNanoSFTDataset(Dataset):
             USER_ROLE_PREFIX + USER_TEMPLATE_REFERENCE_PREFIX,
         )
         suffix_text = self._build_suffix_text(record)
-        assistant_prefix_ids = encode_text(self.tokenizer, USER_TEMPLATE_SUFFIX + ASSISTANT_TURN_PREFIX) + [
-            self.model_config.im_start_token_id
-        ] + encode_text(self.tokenizer, ASSISTANT_ROLE_PREFIX)
+        assistant_prefix_ids = (
+            encode_text(self.tokenizer, USER_TEMPLATE_SUFFIX)
+            + [self.model_config.im_end_token_id]
+            + encode_text(self.tokenizer, ASSISTANT_TURN_PREFIX)
+            + [self.model_config.im_start_token_id]
+            + encode_text(self.tokenizer, ASSISTANT_ROLE_PREFIX)
+        )
 
         sections = [self._build_text_rows(prefix_ids)]
         if reference_codes is None:
