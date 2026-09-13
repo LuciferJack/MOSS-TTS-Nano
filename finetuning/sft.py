@@ -163,7 +163,12 @@ def validate_args(args: argparse.Namespace) -> None:
 
 
 def pcgrad_backward(*, accelerator, model, teacher_loss: torch.Tensor, protector_loss: torch.Tensor):
-    """Backprop both objectives and replace grads with protector + projected teacher."""
+    """Apply only the teacher update, projected to avoid harming the protector.
+
+    The protector gradient defines a half-space constraint; it is deliberately
+    not added to the optimizer gradient.  Adding it would actively fit the
+    preservation batch on every step and can distort duration/EOS behaviour.
+    """
     trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
     optimizer_grads = [None if p.grad is None else p.grad.detach().clone() for p in trainable]
     for parameter in trainable:
@@ -186,14 +191,12 @@ def pcgrad_backward(*, accelerator, model, teacher_loss: torch.Tensor, protector
     offset = 0
     for i, parameter in enumerate(trainable):
         previous = optimizer_grads[i]
-        teacher, protector = teacher_grads[i], protector_grads[i]
+        teacher = teacher_grads[i]
         if i in active_set:
             count = teacher.numel()
-            resolved = protector.float() + projected[offset:offset + count].reshape_as(teacher)
+            resolved = projected[offset:offset + count].reshape_as(teacher)
             offset += count
             parameter.grad = resolved.to(dtype=parameter.dtype)
-        elif protector is not None:
-            parameter.grad = protector
         elif teacher is not None:
             parameter.grad = teacher
         if previous is not None:

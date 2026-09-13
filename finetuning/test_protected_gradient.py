@@ -49,7 +49,7 @@ class ProtectedGradientTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "finite"):
             project_teacher_gradient(torch.tensor([float("nan")]), [torch.tensor([1.0])])
 
-    def test_training_backward_combines_protector_and_projected_teacher(self):
+    def test_training_backward_uses_protector_only_as_constraint(self):
         parameter = torch.nn.Parameter(torch.tensor([0.0, 0.0]))
         model = torch.nn.ParameterList([parameter])
         teacher_loss = (-parameter[0] + parameter[1])
@@ -58,8 +58,32 @@ class ProtectedGradientTests(unittest.TestCase):
             accelerator=_Accelerator(), model=model,
             teacher_loss=teacher_loss, protector_loss=protector_loss,
         )
-        self.assertTrue(torch.allclose(parameter.grad, torch.tensor([1.0, 1.0])))
+        self.assertTrue(torch.allclose(parameter.grad, torch.tensor([0.0, 1.0])))
         self.assertGreaterEqual(report.minimum_dot, 0.0)
+
+    def test_training_backward_does_not_apply_protector_only_parameters(self):
+        teacher_parameter = torch.nn.Parameter(torch.tensor(0.0))
+        protector_parameter = torch.nn.Parameter(torch.tensor(0.0))
+        model = torch.nn.ParameterList([teacher_parameter, protector_parameter])
+        teacher_loss = teacher_parameter
+        protector_loss = teacher_parameter + 7.0 * protector_parameter
+        pcgrad_backward(
+            accelerator=_Accelerator(), model=model,
+            teacher_loss=teacher_loss, protector_loss=protector_loss,
+        )
+        self.assertEqual(float(teacher_parameter.grad), 1.0)
+        self.assertIsNone(protector_parameter.grad)
+
+    def test_training_backward_preserves_existing_optimizer_gradient(self):
+        parameter = torch.nn.Parameter(torch.tensor([0.0, 0.0]))
+        model = torch.nn.ParameterList([parameter])
+        parameter.grad = torch.tensor([3.0, 4.0])
+        pcgrad_backward(
+            accelerator=_Accelerator(), model=model,
+            teacher_loss=(-parameter[0] + parameter[1]),
+            protector_loss=parameter[0],
+        )
+        self.assertTrue(torch.allclose(parameter.grad, torch.tensor([3.0, 5.0])))
 
 
 if __name__ == "__main__":
