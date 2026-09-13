@@ -116,6 +116,7 @@ class MossTTSNanoSFTDataset(Dataset):
             index=index,
         )
         reference_codes = self._resolve_reference_codes(record, index=index)
+        reference_frames = 0 if reference_codes is None else int(reference_codes[0].shape[0])
 
         prompt_rows = self._build_prompt_rows(record=record, reference_codes=reference_codes)
         target_rows = self._build_audio_rows(
@@ -135,7 +136,8 @@ class MossTTSNanoSFTDataset(Dataset):
         if full_sequence.shape[0] > self.max_length:
             raise ValueError(
                 f"Record {index} requires sequence length {full_sequence.shape[0]} "
-                f"(prompt={prompt_length}, audio_frames={target_codes.shape[0]}, stop=1), "
+                f"(prompt={prompt_length}, reference_frames={reference_frames}, "
+                f"audio_frames={target_codes.shape[0]}, stop=1), "
                 f"which exceeds max_length={self.max_length}. Refusing to truncate the "
                 "audio_end supervision target; increase --max-length or shorten the sample."
             )
@@ -149,6 +151,8 @@ class MossTTSNanoSFTDataset(Dataset):
             "full_input_ids": full_sequence,
             "seq_len": torch.tensor(seq_len, dtype=torch.long),
             "prompt_length": torch.tensor(prompt_length, dtype=torch.long),
+            "reference_frames": torch.tensor(reference_frames, dtype=torch.long),
+            "response_audio_frames": torch.tensor(int(target_codes.shape[0]), dtype=torch.long),
             "text_only_eos_calibration": calibration,
         }
 

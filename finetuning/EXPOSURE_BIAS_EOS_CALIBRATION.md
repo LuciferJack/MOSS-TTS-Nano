@@ -34,7 +34,10 @@ source `self_generated_junhao_prefix`, voice `Junhao`, an immutable generator
 revision and checkpoint SHA-256. The exact generation prompt and canonical JSON
 generation config must match their recorded hashes; prompt must equal training
 text and prompt-altering metadata is forbidden. Exact Junhao reference codes and
-the generated prefix codes must also match recorded hashes. Boundary provenance names
+the generated prefix codes must also match recorded hashes. Reference identity,
+asset hash and an independently recorded codec hash are mandatory; copying the
+generated prefix (including the historical one-frame truncation) into the reference
+field is rejected. Boundary provenance names
 the provider, training authorization and teacher-asset SHA-256. The positive
 `target_boundary_frame` must equal the retained prefix length, and
 `codec_loss_eligible` must be false. `audio_codes` is forbidden.

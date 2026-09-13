@@ -92,6 +92,27 @@ def validate_calibration_record(record: Dict[str, Any]) -> None:
         raise ValueError(
             f"Calibration row {sample_id} ref_audio_codes do not match reference_codes_sha256."
         )
+    reference_provenance = record.get("prefix_voice_reference_provenance")
+    if not isinstance(reference_provenance, dict):
+        raise ValueError(
+            f"Calibration row {sample_id} requires prefix_voice_reference_provenance."
+        )
+    _require_sha256(reference_provenance, "audio_asset_sha256", str(sample_id))
+    _require_sha256(reference_provenance, "audio_codes_sha256", str(sample_id))
+    if not str(reference_provenance.get("reference_id", "")).strip():
+        raise ValueError(f"Calibration row {sample_id} requires a Junhao reference_id.")
+    if reference_provenance["audio_codes_sha256"] != record["reference_codes_sha256"]:
+        raise ValueError(
+            f"Calibration row {sample_id} reference codes do not match independent voice provenance."
+        )
+    # A generated trajectory (or a one-row truncation of it) is not a voice
+    # reference. This catches the historical bundle conversion error directly.
+    if reference_codes == codes or (
+        len(reference_codes) + 1 == len(codes) and reference_codes == codes[:-1]
+    ):
+        raise ValueError(
+            f"Calibration row {sample_id} duplicated its generated prefix into ref_audio_codes."
+        )
     generation = record.get("generation_config")
     if not isinstance(generation, dict) or not generation:
         raise ValueError(f"Calibration row {sample_id} requires an explicit generation_config.")
