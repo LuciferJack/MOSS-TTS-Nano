@@ -39,6 +39,7 @@ SCHEDULER_CHOICES = (
     "constant_with_warmup",
     "inverse_sqrt",
 )
+EOS_LOSS_MODES = ("token_weight", "sequence_balanced")
 
 MODEL_SUPPORT_FILES = (
     "__init__.py",
@@ -111,6 +112,15 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Relative weight for the single audio-end target in the text channel. "
             "The default 1.0 is exactly the legacy mean cross-entropy objective."
+        ),
+    )
+    parser.add_argument(
+        "--eos-loss-mode",
+        choices=EOS_LOSS_MODES,
+        default="token_weight",
+        help=(
+            "token_weight preserves token-mean CE; sequence_balanced gives each sample's "
+            "continue mean and stop loss explicit, length-independent weights."
         ),
     )
     parser.add_argument("--seed", type=int, default=42)
@@ -324,6 +334,7 @@ def compute_text_loss(
     audio_end_token_id: int,
     audio_assistant_slot_token_id: int,
     eos_loss_weight: float = 1.0,
+    eos_loss_mode: str = "token_weight",
 ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Compute text-channel CE while keeping continuation and stop observable.
 
@@ -333,22 +344,47 @@ def compute_text_loss(
     Weighting is deliberately based only on the target token ID; audio/VQ
     logits and losses never enter this helper.
     """
+    if logits.ndim != 3 or targets.ndim != 2 or logits.shape[:2] != targets.shape:
+        raise ValueError("Text logits/targets must have shapes (batch, seq, vocab)/(batch, seq).")
+    if eos_loss_mode not in EOS_LOSS_MODES:
+        raise ValueError(f"Unknown eos_loss_mode: {eos_loss_mode!r}.")
     valid = targets.ne(-100)
     if not valid.any():
         raise ValueError("Text loss requires at least one non-ignored target.")
     if not math.isfinite(eos_loss_weight) or eos_loss_weight <= 0:
         raise ValueError("`eos_loss_weight` must be finite and > 0.")
 
-    per_token = F.cross_entropy(logits.float(), targets, ignore_index=-100, reduction="none")
+    flat_logits = logits.reshape(-1, logits.shape[-1])
+    flat_targets = targets.reshape(-1)
+    per_token = F.cross_entropy(
+        flat_logits.float(), flat_targets, ignore_index=-100, reduction="none"
+    ).reshape_as(targets)
     stop = valid & targets.eq(int(audio_end_token_id))
-    continuation = valid & ~stop
-    weights = valid.to(dtype=per_token.dtype)
-    weights = torch.where(stop, weights * float(eos_loss_weight), weights)
-    loss = (per_token * weights).sum() / weights.sum()
+    continuation = valid & targets.eq(int(audio_assistant_slot_token_id))
+    unexpected = valid & ~stop & ~continuation
+    if unexpected.any():
+        unexpected_ids = sorted(set(targets[unexpected].detach().cpu().tolist()))
+        raise ValueError(f"Text targets contain tokens other than slot/end: {unexpected_ids}.")
+    stop_counts = stop.sum(dim=1)
+    if not stop_counts.eq(1).all():
+        raise ValueError(f"Each sample must contain exactly one audio_end target; got {stop_counts.tolist()}.")
+    continuation_counts = continuation.sum(dim=1)
+    if not continuation_counts.gt(0).all():
+        raise ValueError(f"Each sample must contain at least one continuation target; got {continuation_counts.tolist()}.")
+
+    if eos_loss_mode == "token_weight":
+        weights = valid.to(dtype=per_token.dtype)
+        weights = torch.where(stop, weights * float(eos_loss_weight), weights)
+        loss = (per_token * weights).sum() / weights.sum()
+    else:
+        continue_per_sample = (per_token * continuation).sum(dim=1) / continuation_counts
+        stop_per_sample = (per_token * stop).sum(dim=1)  # exactly one by contract
+        loss = ((continue_per_sample + float(eos_loss_weight) * stop_per_sample)
+                / (1.0 + float(eos_loss_weight))).mean()
     # Runtime termination is a binary decision between continuing with the
     # assistant slot and stopping with audio_end. Report that exact decision.
-    slot_logits = logits[:, int(audio_assistant_slot_token_id)].float()
-    stop_logits = logits[:, int(audio_end_token_id)].float()
+    slot_logits = logits[:, :, int(audio_assistant_slot_token_id)].float()
+    stop_logits = logits[:, :, int(audio_end_token_id)].float()
 
     nan = torch.full((), float("nan"), device=logits.device, dtype=torch.float32)
     breakdown: Dict[str, torch.Tensor] = {}
@@ -359,6 +395,9 @@ def compute_text_loss(
         breakdown[f"{name}_accuracy"] = correct[mask].float().mean().detach() if mask.any() else nan
         breakdown[f"{name}_margin"] = signed_margin[mask].mean().detach() if mask.any() else nan
         breakdown[f"{name}_count"] = mask.sum().detach().float()
+    breakdown["text_sequence_count"] = torch.tensor(
+        targets.shape[0], device=logits.device, dtype=torch.float32
+    )
     return loss, breakdown
 
 
@@ -370,6 +409,7 @@ def compute_supervised_loss(
     labels: torch.LongTensor,
     channelwise_loss_weight: List[float],
     eos_loss_weight: float = 1.0,
+    eos_loss_mode: str = "token_weight",
     return_breakdown: bool = False,
 ):
     outputs = model(
@@ -446,6 +486,7 @@ def compute_supervised_loss(
             "text_stop_margin",
             "text_continue_count",
             "text_stop_count",
+            "text_sequence_count",
             *(f"vq{index}" for index in range(n_vq)),
         )
     }
@@ -453,11 +494,12 @@ def compute_supervised_loss(
     text_logits = base_model.text_lm_head(local_hidden_states[:, 0, :])
     if (text_targets != -100).any():
         text_loss, text_breakdown = compute_text_loss(
-            text_logits,
-            text_targets,
+            text_logits.reshape(batch_size, seq_len, -1),
+            labels[:, :, 0],
             audio_end_token_id=int(base_model.config.audio_end_token_id),
             audio_assistant_slot_token_id=int(base_model.config.audio_assistant_slot_token_id),
             eos_loss_weight=eos_loss_weight,
+            eos_loss_mode=eos_loss_mode,
         )
         channel_losses["text"] = text_loss.detach().float()
         channel_losses.update(text_breakdown)
@@ -755,6 +797,7 @@ def main() -> None:
                     labels=batch["labels"],
                     channelwise_loss_weight=channelwise_loss_weight,
                     eos_loss_weight=args.eos_loss_weight,
+                    eos_loss_mode=args.eos_loss_mode,
                     return_breakdown=True,
                 )
                 projection_report = None
@@ -773,6 +816,7 @@ def main() -> None:
                         labels=protect_batch["labels"],
                         channelwise_loss_weight=protect_channelwise_loss_weight,
                         eos_loss_weight=args.eos_loss_weight,
+                        eos_loss_mode=args.eos_loss_mode,
                     )
                     projection_report = pcgrad_backward(
                         accelerator=accelerator,
