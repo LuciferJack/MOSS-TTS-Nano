@@ -7,7 +7,7 @@ import shutil
 import time
 from pathlib import Path
 import sys
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -149,6 +149,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--pcgrad", action="store_true", help="Project teacher gradients against a preservation batch.")
     parser.add_argument("--protect-jsonl", type=str, default="", help="Held-out preservation JSONL required by --pcgrad.")
+    parser.add_argument(
+        "--behavior-protect-jsonl", type=str, default="",
+        help="Two pinned text/EOS behavior rows used only as PCGrad constraints.",
+    )
+    parser.add_argument(
+        "--behavior-protect-channelwise-loss-weight", type=str, default="1,0",
+        help="Behavior constraint weights; calibration training requires exactly text-only 1,0.",
+    )
     return parser.parse_args()
 
 
@@ -191,37 +199,77 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("`--protect-jsonl` is required with `--pcgrad`.")
     if args.pcgrad and args.gradient_accumulation_steps != 1:
         raise ValueError("PCGrad currently requires `--gradient-accumulation-steps 1`.")
+    if args.behavior_protect_jsonl and not args.pcgrad:
+        raise ValueError("`--behavior-protect-jsonl` requires `--pcgrad`.")
     if args.train_schedule_json and args.per_device_batch_size != 1:
         raise ValueError("Scheduled training requires `--per-device-batch-size 1` for step-level auditability.")
     if args.train_schedule_json and args.gradient_accumulation_steps != 1:
         raise ValueError("Scheduled training requires `--gradient-accumulation-steps 1`.")
 
 
-def pcgrad_backward(*, accelerator, model, teacher_loss: torch.Tensor, protector_loss: torch.Tensor):
+def pcgrad_backward(
+    *, accelerator, model, teacher_loss: torch.Tensor,
+    protector_loss: Optional[torch.Tensor] = None,
+    protector_losses: Optional[List[torch.Tensor]] = None,
+    protector_loss_factories: Optional[List[Callable[[], torch.Tensor]]] = None,
+):
     """Apply only the teacher update, projected to avoid harming the protector.
 
     The protector gradient defines a half-space constraint; it is deliberately
     not added to the optimizer gradient.  Adding it would actively fit the
     preservation batch on every step and can distort duration/EOS behaviour.
     """
+    losses = list(protector_losses or ([] if protector_loss is None else [protector_loss]))
+    factories = list(protector_loss_factories or [])
+    if losses and factories:
+        raise ValueError("Pass protector losses or factories, not both.")
+    if not losses and not factories:
+        raise ValueError("PCGrad requires at least one protector loss.")
     trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
     optimizer_grads = [None if p.grad is None else p.grad.detach().clone() for p in trainable]
     for parameter in trainable:
         parameter.grad = None
-    accelerator.backward(protector_loss)
-    protector_grads = [None if p.grad is None else p.grad.detach().clone() for p in trainable]
-    for parameter in trainable:
-        parameter.grad = None
-    accelerator.backward(teacher_loss)
+    # Factory mode is used by dual protection so only one protector forward
+    # graph exists at a time. Keep the constraint vectors on CPU to avoid ten
+    # model-sized gradient copies consuming accelerator memory.
+    if factories:
+        accelerator.backward(teacher_loss)
+    else:
+        all_protector_grads = []
+        for loss in losses:
+            accelerator.backward(loss)
+            all_protector_grads.append(
+                [None if p.grad is None else p.grad.detach().clone() for p in trainable]
+            )
+            for parameter in trainable:
+                parameter.grad = None
+        accelerator.backward(teacher_loss)
     teacher_grads = [None if p.grad is None else p.grad.detach().clone() for p in trainable]
-
-    active = [i for i, (teacher, protector) in enumerate(zip(teacher_grads, protector_grads))
-              if teacher is not None and protector is not None]
+    active = [i for i, teacher in enumerate(teacher_grads) if teacher is not None]
     if not active:
-        raise RuntimeError("PCGrad found no parameters shared by teacher and protector losses.")
-    teacher_flat = torch.cat([teacher_grads[i].float().reshape(-1) for i in active])
-    protector_flat = torch.cat([protector_grads[i].float().reshape(-1) for i in active])
-    projected, report = project_teacher_gradient(teacher_flat, [protector_flat])
+        raise RuntimeError("PCGrad found no teacher gradient.")
+    teacher_flat = torch.cat([teacher_grads[i].float().reshape(-1).cpu() for i in active])
+    protector_flats: List[torch.Tensor] = []
+    if factories:
+        for parameter in trainable:
+            parameter.grad = None
+        for factory in factories:
+            accelerator.backward(factory())
+            protector_flats.append(torch.cat([
+                (torch.zeros_like(teacher_grads[i]) if trainable[i].grad is None else trainable[i].grad)
+                .detach().float().reshape(-1).cpu()
+                for i in active
+            ]))
+            for parameter in trainable:
+                parameter.grad = None
+    else:
+        for grads in all_protector_grads:
+            protector_flats.append(torch.cat([
+                (torch.zeros_like(teacher_grads[i]) if grads[i] is None else grads[i])
+                .float().reshape(-1).cpu()
+                for i in active
+            ]))
+    projected, report = project_teacher_gradient(teacher_flat, protector_flats)
     active_set = set(active)
     offset = 0
     for i, parameter in enumerate(trainable):
@@ -231,7 +279,7 @@ def pcgrad_backward(*, accelerator, model, teacher_loss: torch.Tensor, protector
             count = teacher.numel()
             resolved = projected[offset:offset + count].reshape_as(teacher)
             offset += count
-            parameter.grad = resolved.to(dtype=parameter.dtype)
+            parameter.grad = resolved.to(device=parameter.device, dtype=parameter.dtype)
         elif teacher is not None:
             parameter.grad = teacher
         if previous is not None:
@@ -334,6 +382,45 @@ def validate_calibration_objective(
         raise ValueError("Self-generated EOS calibration requires sequence_balanced EOS loss.")
     if channelwise_loss_weight[0] != 1 or any(weight != 0 for weight in channelwise_loss_weight[1:]):
         raise ValueError("Self-generated EOS calibration requires channel weights 1,0 (zero VQ loss).")
+
+
+def validate_behavior_protection(
+    records: List[Dict[str, Any]], acoustic_records: List[Dict[str, Any]],
+    behavior_records: List[Dict[str, Any]],
+    *, acoustic_weights: List[float], behavior_weights: List[float],
+    eos_loss_mode: str, train_schedule: Optional[List[str]] = None,
+) -> None:
+    calibration = validate_calibration_records(records)
+    if not calibration:
+        if behavior_records:
+            raise ValueError("Behavior protection is only supported for EOS calibration training.")
+        return
+    if not behavior_records:
+        raise ValueError("EOS calibration requires --behavior-protect-jsonl.")
+    if len(calibration) != len(records):
+        raise ValueError("Behavior replay must not be mixed into calibration train rows.")
+    if len(calibration) != 5:
+        raise ValueError("EOS calibration schedule requires exactly five calibration train rows.")
+    if train_schedule is not None and (
+        len(train_schedule) != 5 or train_schedule != [stable_sample_id(row) for row in records]
+    ):
+        raise ValueError("EOS calibration requires an explicit five-row schedule matching train order.")
+    if len(acoustic_records) != 8:
+        raise ValueError("Dual PCGrad requires exactly eight acoustic protector rows.")
+    if len(behavior_records) != 2:
+        raise ValueError("Behavior protection requires exactly two pinned replay rows.")
+    if validate_calibration_records(behavior_records):
+        raise ValueError("Behavior protect rows must be ordinary replay rows, not calibration rows.")
+    train_ids = {stable_sample_id(row) for row in records}
+    behavior_ids = [stable_sample_id(row) for row in behavior_records]
+    if len(set(behavior_ids)) != 2 or train_ids.intersection(behavior_ids):
+        raise ValueError("Behavior protector IDs must be unique and disjoint from train rows.")
+    if eos_loss_mode != "sequence_balanced":
+        raise ValueError("Behavior protection requires sequence_balanced EOS loss.")
+    if acoustic_weights[0] != 0 or not math.isclose(sum(acoustic_weights[1:]), 1.0):
+        raise ValueError("Acoustic protection requires channel weights 0,1.")
+    if behavior_weights[0] != 1 or any(weight != 0 for weight in behavior_weights[1:]):
+        raise ValueError("Behavior protection requires channel weights 1,0 (zero VQ loss).")
 
 
 def build_optimizer(model, args: argparse.Namespace) -> AdamW:
@@ -716,6 +803,9 @@ def main() -> None:
     records_paths, records = load_jsonl_spec(args.train_jsonl)
     records, train_schedule = apply_train_schedule(records, args.train_schedule_json)
     protect_records_paths, protect_records = (load_jsonl_spec(args.protect_jsonl) if args.pcgrad else ([], []))
+    behavior_records_paths, behavior_records = (
+        load_jsonl_spec(args.behavior_protect_jsonl) if args.behavior_protect_jsonl else ([], [])
+    )
     if train_schedule and args.max_train_steps != len(train_schedule):
         raise ValueError(
             "Scheduled training requires max_train_steps to equal the schedule length "
@@ -766,6 +856,7 @@ def main() -> None:
         collate_fn=dataset.collate_fn,
     )
     protect_dataloader = None
+    behavior_protect_dataloader = None
     if args.pcgrad:
         protect_dataset = MossTTSNanoSFTDataset(
             protect_records,
@@ -781,6 +872,15 @@ def main() -> None:
             pin_memory=torch.cuda.is_available(),
             collate_fn=protect_dataset.collate_fn,
         )
+    if behavior_records:
+        behavior_dataset = MossTTSNanoSFTDataset(
+            behavior_records, tokenizer=tokenizer, model_config=model.config, max_length=args.max_length,
+        )
+        behavior_protect_dataloader = DataLoader(
+            behavior_dataset, batch_size=args.per_device_batch_size, shuffle=True,
+            num_workers=args.num_workers, pin_memory=torch.cuda.is_available(),
+            collate_fn=behavior_dataset.collate_fn,
+        )
 
     optimizer = build_optimizer(model, args)
     global_batch_size = (
@@ -794,10 +894,20 @@ def main() -> None:
         args,
         int(model.config.n_vq) + 1,
     )
+    behavior_protect_channelwise_loss_weight = parse_channelwise_loss_weight(
+        args.behavior_protect_channelwise_loss_weight, int(model.config.n_vq) + 1,
+    )
     validate_calibration_objective(
         records, eos_loss_mode=args.eos_loss_mode,
         channelwise_loss_weight=channelwise_loss_weight,
     )
+    if args.pcgrad:
+        validate_behavior_protection(
+            records, protect_records, behavior_records,
+            acoustic_weights=protect_channelwise_loss_weight,
+            behavior_weights=behavior_protect_channelwise_loss_weight,
+            eos_loss_mode=args.eos_loss_mode, train_schedule=train_schedule,
+        )
 
     lr_scheduler = get_scheduler(
         name=args.lr_scheduler_type,
@@ -809,9 +919,13 @@ def main() -> None:
         model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
             model, optimizer, train_dataloader, lr_scheduler,
         )
-    else:
+    elif behavior_protect_dataloader is None:
         model, optimizer, train_dataloader, protect_dataloader, lr_scheduler = accelerator.prepare(
             model, optimizer, train_dataloader, protect_dataloader, lr_scheduler,
+        )
+    else:
+        model, optimizer, train_dataloader, protect_dataloader, behavior_protect_dataloader, lr_scheduler = accelerator.prepare(
+            model, optimizer, train_dataloader, protect_dataloader, behavior_protect_dataloader, lr_scheduler,
         )
 
     output_root = Path(args.output_dir)
@@ -823,10 +937,12 @@ def main() -> None:
     train_args_to_save["resolved_warmup_steps"] = warmup_steps
     train_args_to_save["resolved_channelwise_loss_weight"] = channelwise_loss_weight
     train_args_to_save["resolved_protect_channelwise_loss_weight"] = protect_channelwise_loss_weight
+    train_args_to_save["resolved_behavior_protect_channelwise_loss_weight"] = behavior_protect_channelwise_loss_weight
     train_args_to_save["global_batch_size"] = global_batch_size
     train_args_to_save["records_paths"] = [str(path.resolve()) for path in records_paths]
     train_args_to_save["resolved_train_schedule"] = train_schedule
     train_args_to_save["protect_records_paths"] = [str(path.resolve()) for path in protect_records_paths]
+    train_args_to_save["behavior_protect_records_paths"] = [str(path.resolve()) for path in behavior_records_paths]
     train_args_to_save["attn_implementation"] = attn_implementation
     trainable_parameters = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
     total_parameters = sum(parameter.numel() for parameter in model.parameters())
@@ -852,8 +968,6 @@ def main() -> None:
     completed_epochs = 0
     last_log_time = time.perf_counter()
     last_logged_step = 0
-    protect_iterator = iter(protect_dataloader) if protect_dataloader is not None else None
-
     for epoch in range(args.num_epochs):
         model.train()
         for batch in train_dataloader:
@@ -872,25 +986,27 @@ def main() -> None:
                 if protect_dataloader is None:
                     accelerator.backward(loss)
                 else:
-                    try:
-                        protect_batch = next(protect_iterator)
-                    except StopIteration:
-                        protect_iterator = iter(protect_dataloader)
-                        protect_batch = next(protect_iterator)
-                    protector_loss = compute_supervised_loss(
-                        model,
-                        input_ids=protect_batch["input_ids"],
-                        attention_mask=protect_batch["attention_mask"],
-                        labels=protect_batch["labels"],
-                        channelwise_loss_weight=protect_channelwise_loss_weight,
-                        eos_loss_weight=args.eos_loss_weight,
-                        eos_loss_mode=args.eos_loss_mode,
+                    acoustic_batches = list(protect_dataloader)
+                    behavior_batches = list(behavior_protect_dataloader or [])
+                    protector_loss_factories = [
+                        lambda item=item: compute_supervised_loss(
+                            model, input_ids=item["input_ids"], attention_mask=item["attention_mask"],
+                            labels=item["labels"], channelwise_loss_weight=protect_channelwise_loss_weight,
+                            eos_loss_weight=args.eos_loss_weight, eos_loss_mode=args.eos_loss_mode,
+                        ) for item in acoustic_batches
+                    ]
+                    protector_loss_factories.extend(
+                        lambda item=item: compute_supervised_loss(
+                            model, input_ids=item["input_ids"], attention_mask=item["attention_mask"],
+                            labels=item["labels"], channelwise_loss_weight=behavior_protect_channelwise_loss_weight,
+                            eos_loss_weight=args.eos_loss_weight, eos_loss_mode="sequence_balanced",
+                        ) for item in behavior_batches
                     )
                     projection_report = pcgrad_backward(
                         accelerator=accelerator,
                         model=model,
                         teacher_loss=loss,
-                        protector_loss=protector_loss,
+                        protector_loss_factories=protector_loss_factories,
                     )
 
                 gradient_norms = None
@@ -947,12 +1063,23 @@ def main() -> None:
                                 "channel_loss": gathered_channels,
                                 "gradient_norm_pre_clip": gradient_norms or {},
                                 "teacher_sample_ids": list(batch.get("sample_ids", [])) if args.pcgrad else None,
-                                "protector_sample_ids": list(protect_batch.get("sample_ids", [])) if args.pcgrad else None,
+                                "protector_sample_ids": [sid for item in acoustic_batches for sid in item.get("sample_ids", [])] if args.pcgrad else None,
+                                "acoustic_protector_sample_ids": [sid for item in acoustic_batches for sid in item.get("sample_ids", [])] if args.pcgrad else None,
+                                "behavior_protector_sample_ids": [sid for item in behavior_batches for sid in item.get("sample_ids", [])] if args.pcgrad else None,
                                 "pcgrad": None if projection_report is None else {
                                     "iterations": projection_report.iterations,
                                     "original_minimum_dot": projection_report.original_minimum_dot,
                                     "minimum_dot": projection_report.minimum_dot,
                                     "retained_norm_ratio": projection_report.retained_norm_ratio,
+                                    "original_constraint_dots": list(projection_report.original_dots),
+                                    "constraint_dots": list(projection_report.dots),
+                                    "acoustic_original_dots": list(projection_report.original_dots[:len(acoustic_batches)]),
+                                    "acoustic_constraint_dots": list(projection_report.dots[:len(acoustic_batches)]),
+                                    "behavior_original_dots": list(projection_report.original_dots[len(acoustic_batches):]),
+                                    "behavior_constraint_dots": list(projection_report.dots[len(acoustic_batches):]),
+                                    "constraint_kinds": (
+                                        ["acoustic"] * len(acoustic_batches) + ["behavior"] * len(behavior_batches)
+                                    ),
                                 },
                             })
 

@@ -6,7 +6,10 @@ from argparse import Namespace
 import torch
 
 from finetuning.protected_gradient import project_teacher_gradient
-from finetuning.sft import pcgrad_backward, resolve_objective_loss_weights
+from finetuning.sft import (
+    pcgrad_backward, resolve_objective_loss_weights, validate_behavior_protection,
+)
+from finetuning.test_eos_calibration import calibration_row
 
 
 class _Accelerator:
@@ -60,6 +63,77 @@ class ProtectedGradientTests(unittest.TestCase):
         )
         self.assertTrue(torch.allclose(parameter.grad, torch.tensor([0.0, 1.0])))
         self.assertGreaterEqual(report.minimum_dot, 0.0)
+
+    def test_training_backward_satisfies_acoustic_and_behavior_constraints(self):
+        parameter = torch.nn.Parameter(torch.tensor([0.0, 0.0, 0.0]))
+        model = torch.nn.ParameterList([parameter])
+        report = pcgrad_backward(
+            accelerator=_Accelerator(), model=model,
+            teacher_loss=-parameter[0] - parameter[1] + parameter[2],
+            protector_losses=[parameter[0], parameter[1]],
+        )
+        self.assertTrue(torch.allclose(parameter.grad, torch.tensor([0.0, 0.0, 1.0])))
+        self.assertEqual(len(report.dots), 2)
+        self.assertTrue(all(dot >= 0 for dot in report.dots))
+
+    def test_factory_constraints_are_built_and_consumed_sequentially(self):
+        parameter = torch.nn.Parameter(torch.tensor([0.0, 0.0, 0.0]))
+        model = torch.nn.ParameterList([parameter])
+        calls = []
+        def factory(index):
+            def build():
+                calls.append(index)
+                return parameter[index]
+            return build
+        report = pcgrad_backward(
+            accelerator=_Accelerator(), model=model,
+            teacher_loss=-parameter[0] - parameter[1] + parameter[2],
+            protector_loss_factories=[factory(0), factory(1)],
+        )
+        self.assertEqual(calls, [0, 1])
+        self.assertTrue(all(dot >= 0 for dot in report.dots))
+        self.assertTrue(torch.allclose(parameter.grad, torch.tensor([0.0, 0.0, 1.0])))
+
+    def test_dual_protection_manifest_is_fail_closed(self):
+        train = []
+        for index in range(5):
+            row = calibration_row()
+            row["id"] = f"cal-{index}"
+            train.append(row)
+        acoustic = [{"id": f"acoustic-{index}", "text": "保护", "audio_codes": [[1, 2]]}
+                    for index in range(8)]
+        behavior = [
+            {"id": "behavior-acronym", "text": "GPU", "audio_codes": [[1, 2]]},
+            {"id": "behavior-ordinary", "text": "普通句子", "audio_codes": [[1, 2]]},
+        ]
+        validate_behavior_protection(
+            train, acoustic, behavior, acoustic_weights=[0, 0.5, 0.5],
+            behavior_weights=[1, 0, 0], eos_loss_mode="sequence_balanced",
+            train_schedule=[row["id"] for row in train],
+        )
+        invalid_cases = [
+            (train + [behavior[0]], acoustic, behavior),
+            (train, acoustic[:-1], behavior),
+            (train, acoustic, behavior[:1]),
+            (train, acoustic, [behavior[0], behavior[0]]),
+        ]
+        for candidate_train, candidate_acoustic, candidate_behavior in invalid_cases:
+            with self.assertRaises(ValueError):
+                validate_behavior_protection(
+                    candidate_train, candidate_acoustic, candidate_behavior,
+                    acoustic_weights=[0, 0.5, 0.5], behavior_weights=[1, 0, 0],
+                    eos_loss_mode="sequence_balanced", train_schedule=[row["id"] for row in candidate_train],
+                )
+        with self.assertRaises(ValueError):
+            validate_behavior_protection(
+                train, acoustic, behavior, acoustic_weights=[0, 0.5, 0.5],
+                behavior_weights=[1, 0.5, 0], eos_loss_mode="sequence_balanced",
+            )
+        with self.assertRaisesRegex(ValueError, "explicit five-row schedule"):
+            validate_behavior_protection(
+                train, acoustic, behavior, acoustic_weights=[0, 0.5, 0.5],
+                behavior_weights=[1, 0, 0], eos_loss_mode="sequence_balanced", train_schedule=[],
+            )
 
     def test_training_backward_does_not_apply_protector_only_parameters(self):
         teacher_parameter = torch.nn.Parameter(torch.tensor(0.0))

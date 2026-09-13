@@ -12,6 +12,8 @@ class ProjectionReport:
     original_minimum_dot: float
     minimum_dot: float
     retained_norm_ratio: float
+    original_dots: tuple[float, ...] = ()
+    dots: tuple[float, ...] = ()
 
 
 def project_teacher_gradient(
@@ -61,4 +63,8 @@ def project_teacher_gradient(
     retained_ratio = float(projected.norm() / original_norm)
     if retained_ratio < minimum_retained_ratio:
         raise RuntimeError(f"teacher signal collapsed during projection: retained={retained_ratio:.6f}")
-    return projected, ProjectionReport(iterations, original_minimum_dot, minimum_dot, retained_ratio)
+    return projected, ProjectionReport(
+        iterations, original_minimum_dot, minimum_dot, retained_ratio,
+        tuple(float(teacher.dot(item)) for item in protectors),
+        tuple(float(projected.dot(item)) for item in protectors),
+    )
