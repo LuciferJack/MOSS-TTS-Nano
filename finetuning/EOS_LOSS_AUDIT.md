@@ -41,3 +41,20 @@ and the complete finetuning test discovery passes 93/93.
 The real four-teacher/eight-protector bundle packs to at most 160 tokens at
 `max_length=256` (teacher maximum 147, protector maximum 160); no stop target is
 truncated. No training or GPU execution was performed for this change.
+
+## Seven-step coverage schedule
+
+The first four-step sequence-balanced run used the seeded shuffled order
+`heptahydrate, dihydrate, ordinary replay, acronym replay`. It therefore saw
+only two of five hydrate teachers and ended with two consecutive replay
+updates. Stopping partway through a shuffled epoch is not a coverage guarantee.
+
+`--train-schedule-json` now accepts an exact, duplicate-free permutation of all
+training sample IDs. Scheduled runs disable DataLoader shuffle and require
+`max_train_steps` to equal the schedule length, preventing an incomplete epoch
+or an unreported second-epoch restart. The checked-in seven-step schedule
+interleaves the two replay rows after professional steps 2 and 4 and finishes
+on `doubao_hydrate_decahydrate`; all five hydrate teachers and both replay rows
+are visited exactly once. Per-step diagnostics provide the executed
+`teacher_sample_ids` for comparison with the resolved schedule stored in the
+checkpoint configuration.

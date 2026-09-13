@@ -24,7 +24,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from finetuning.common import format_duration, format_timestamp, load_jsonl_spec
-from finetuning.dataset import MossTTSNanoSFTDataset
+from finetuning.dataset import MossTTSNanoSFTDataset, stable_sample_id
 from finetuning.protected_gradient import project_teacher_gradient
 
 DEFAULT_MODEL_PATH = REPO_ROOT / "models" / "MOSS-TTS-Nano"
@@ -85,6 +85,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--save-every-epochs", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument(
+        "--train-schedule-json",
+        type=str,
+        default="",
+        help=(
+            "Optional JSON array containing every training sample ID exactly once. "
+            "When set, training is sequential and max_train_steps must equal its length."
+        ),
+    )
     parser.add_argument("--mixed-precision", type=str, default="bf16", choices=["no", "fp16", "bf16"])
     parser.add_argument(
         "--allow-cpu",
@@ -181,6 +190,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("`--protect-jsonl` is required with `--pcgrad`.")
     if args.pcgrad and args.gradient_accumulation_steps != 1:
         raise ValueError("PCGrad currently requires `--gradient-accumulation-steps 1`.")
+    if args.train_schedule_json and args.per_device_batch_size != 1:
+        raise ValueError("Scheduled training requires `--per-device-batch-size 1` for step-level auditability.")
+    if args.train_schedule_json and args.gradient_accumulation_steps != 1:
+        raise ValueError("Scheduled training requires `--gradient-accumulation-steps 1`.")
 
 
 def pcgrad_backward(*, accelerator, model, teacher_loss: torch.Tensor, protector_loss: torch.Tensor):
@@ -318,6 +331,35 @@ def build_optimizer(model, args: argparse.Namespace) -> AdamW:
         betas=(args.adam_beta1, args.adam_beta2),
         eps=args.adam_eps,
     )
+
+
+def apply_train_schedule(
+    records: List[Dict[str, Any]], schedule_path: str,
+) -> tuple[List[Dict[str, Any]], List[str]]:
+    """Validate and apply a single auditable epoch schedule."""
+    if not schedule_path:
+        return records, []
+    path = Path(schedule_path)
+    try:
+        schedule = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Cannot read train schedule {path}: {exc}") from exc
+    if not isinstance(schedule, list) or not schedule or not all(isinstance(item, str) and item for item in schedule):
+        raise ValueError("Train schedule must be a non-empty JSON array of sample ID strings.")
+    if len(schedule) != len(set(schedule)):
+        raise ValueError("Train schedule contains duplicate sample IDs.")
+
+    by_id: Dict[str, Dict[str, Any]] = {}
+    for record in records:
+        sample_id = stable_sample_id(record)
+        if sample_id in by_id:
+            raise ValueError(f"Training records contain duplicate sample ID: {sample_id}")
+        by_id[sample_id] = record
+    missing = sorted(set(by_id) - set(schedule))
+    unknown = sorted(set(schedule) - set(by_id))
+    if missing or unknown or len(schedule) != len(records):
+        raise ValueError(f"Train schedule must be an exact permutation; missing={missing}, unknown={unknown}.")
+    return [by_id[sample_id] for sample_id in schedule], schedule
 
 
 def unwrap_training_model(model):
@@ -653,11 +695,19 @@ def main() -> None:
         )
     if args.pcgrad and accelerator.num_processes != 1:
         raise EnvironmentError("PCGrad is currently validated only for one CPU process or one GPU.")
+    if args.train_schedule_json and accelerator.num_processes != 1:
+        raise EnvironmentError("Scheduled training requires exactly one process for deterministic sample order.")
 
     model_dtype = resolve_torch_dtype(args.mixed_precision)
     attn_implementation = resolve_attn_implementation(args.attn_implementation, model_dtype)
     records_paths, records = load_jsonl_spec(args.train_jsonl)
+    records, train_schedule = apply_train_schedule(records, args.train_schedule_json)
     protect_records_paths, protect_records = (load_jsonl_spec(args.protect_jsonl) if args.pcgrad else ([], []))
+    if train_schedule and args.max_train_steps != len(train_schedule):
+        raise ValueError(
+            "Scheduled training requires max_train_steps to equal the schedule length "
+            f"({len(train_schedule)}), got {args.max_train_steps}."
+        )
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
     if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
@@ -697,7 +747,7 @@ def main() -> None:
     train_dataloader = DataLoader(
         dataset,
         batch_size=args.per_device_batch_size,
-        shuffle=True,
+        shuffle=not bool(train_schedule),
         num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
         collate_fn=dataset.collate_fn,
@@ -758,6 +808,7 @@ def main() -> None:
     train_args_to_save["resolved_protect_channelwise_loss_weight"] = protect_channelwise_loss_weight
     train_args_to_save["global_batch_size"] = global_batch_size
     train_args_to_save["records_paths"] = [str(path.resolve()) for path in records_paths]
+    train_args_to_save["resolved_train_schedule"] = train_schedule
     train_args_to_save["protect_records_paths"] = [str(path.resolve()) for path in protect_records_paths]
     train_args_to_save["attn_implementation"] = attn_implementation
     trainable_parameters = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
