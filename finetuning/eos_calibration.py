@@ -66,11 +66,27 @@ def validate_calibration_record(record: Dict[str, Any]) -> None:
     revision = record.get("prefix_generator_revision")
     if not isinstance(revision, str) or not revision.strip():
         raise ValueError(f"Calibration row {sample_id} requires prefix_generator_revision.")
+    round_number = record.get("on_policy_round", 1)
+    if (
+        not isinstance(round_number, int) or isinstance(round_number, bool)
+        or not 1 <= round_number <= 3
+    ):
+        raise ValueError(f"Calibration row {sample_id} requires on_policy_round in [1, 3].")
     for field in (
         "prefix_generator_model_sha256", "prefix_codes_sha256", "reference_codes_sha256",
         "prompt_sha256", "generation_config_sha256",
     ):
         _require_sha256(record, field, str(sample_id))
+    if round_number >= 2:
+        _require_sha256(record, "parent_candidate_sha256", str(sample_id))
+        if record["parent_candidate_sha256"] != record["prefix_generator_model_sha256"]:
+            raise ValueError(
+                f"Calibration row {sample_id} round-2 prefix must come from its parent candidate."
+            )
+        if record.get("adapter_initialization") != "fresh_on_merged_parent":
+            raise ValueError(
+                f"Calibration row {sample_id} round-2 requires fresh_on_merged_parent initialization."
+            )
     prompt = record.get("generation_prompt")
     if not isinstance(prompt, str) or not prompt:
         raise ValueError(f"Calibration row {sample_id} requires the exact generation_prompt.")
@@ -138,4 +154,12 @@ def validate_calibration_records(records: Iterable[Dict[str, Any]]) -> List[Dict
         if sample_id in seen:
             raise ValueError(f"Duplicate calibration sample ID: {sample_id}")
         seen.add(sample_id)
+    if calibration:
+        source_keys = {
+            (row.get("on_policy_round", 1), row["prefix_generator_revision"],
+             row["prefix_generator_model_sha256"])
+            for row in calibration
+        }
+        if len(source_keys) != 1:
+            raise ValueError("Calibration rows must share one on-policy round, revision, and source model SHA.")
     return calibration

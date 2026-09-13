@@ -58,3 +58,30 @@ negative values inside this absolute tolerance are floating-point residuals.
 Diagnostics record `feasibility_tolerance` and `constraint_violation_count`,
 and the run fails if any dot is below the recorded tolerance or if less than
 5% of the teacher-gradient norm remains.
+
+## DAgger round 2 (formula-scoped adapter)
+
+Round 2 must regenerate exactly five prefixes from the latest accepted merged
+round-1 candidate, not from base and not from its pre-merge adapter. The current
+candidate weight digest is
+`9e7a3f5c4c86a3617b75cbdeaa1c40b92fd54b1f59761891646e00967613df38`;
+the immutable source revision must also be supplied independently. Every row
+records round `2`, that same generator SHA/revision, a matching
+`parent_candidate_sha256`, and `adapter_initialization=fresh_on_merged_parent`.
+The trainer hashes the actual `pytorch_model.bin`, rejects adapter directories,
+and attaches a new LoRA. This prevents accidental adapter stacking or stale
+policy trajectories.
+
+Use one audited five-ID schedule, one row per optimizer step, exactly once. The
+professional formula adapter retains all eight independent acoustic PCGrad
+constraints (`0,1`) but excludes the two general behavior rows from its optimizer
+geometry; acronym/general behavior remain external acceptance gates. After five
+steps, merge the new adapter into the exact parent and evaluate the fixed suite.
+
+Accept a round only if all five raw and normalized formula cases stop before the
+cap, stop margins are positive, every acoustic constraint meets the recorded
+PCGrad tolerance/retention gates, and acronym/general free-run plus audio quality
+do not regress. Run at most one five-step update before regenerating trajectories
+from the newly accepted merge. Reject on any regression, never reuse stale
+prefixes, and cap iterative rounds at three. These rules prevent alternating
+between stale-policy over-correction and a newly exposed continuation attractor.

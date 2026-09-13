@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import shutil
@@ -156,6 +157,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--behavior-protect-channelwise-loss-weight", type=str, default="1,0",
         help="Behavior constraint weights; calibration training requires exactly text-only 1,0.",
+    )
+    parser.add_argument(
+        "--calibration-protection-scope", choices=("dual", "formula_scoped"), default="dual",
+        help="formula_scoped retains eight acoustic constraints but excludes behavior replay.",
+    )
+    parser.add_argument(
+        "--calibration-source-model-sha256", default="",
+        help="Expected merged policy SHA-256; mandatory for round-2 calibration.",
+    )
+    parser.add_argument(
+        "--calibration-source-revision", default="",
+        help="Expected immutable generator revision; mandatory for round-2 calibration.",
     )
     return parser.parse_args()
 
@@ -384,18 +397,27 @@ def validate_calibration_objective(
         raise ValueError("Self-generated EOS calibration requires channel weights 1,0 (zero VQ loss).")
 
 
+def validate_calibration_protection_enabled(records: List[Dict[str, Any]], *, pcgrad: bool) -> None:
+    if validate_calibration_records(records) and not pcgrad:
+        raise ValueError("On-policy EOS calibration requires --pcgrad and acoustic protection.")
+
+
 def validate_behavior_protection(
     records: List[Dict[str, Any]], acoustic_records: List[Dict[str, Any]],
     behavior_records: List[Dict[str, Any]],
     *, acoustic_weights: List[float], behavior_weights: List[float],
     eos_loss_mode: str, train_schedule: Optional[List[str]] = None,
+    protection_scope: str = "dual", expected_source_sha256: str = "",
+    expected_source_revision: str = "",
 ) -> None:
     calibration = validate_calibration_records(records)
     if not calibration:
         if behavior_records:
             raise ValueError("Behavior protection is only supported for EOS calibration training.")
         return
-    if not behavior_records:
+    if protection_scope not in {"dual", "formula_scoped"}:
+        raise ValueError(f"Unknown calibration protection scope: {protection_scope}")
+    if protection_scope == "dual" and not behavior_records:
         raise ValueError("EOS calibration requires --behavior-protect-jsonl.")
     if len(calibration) != len(records):
         raise ValueError("Behavior replay must not be mixed into calibration train rows.")
@@ -407,20 +429,58 @@ def validate_behavior_protection(
         raise ValueError("EOS calibration requires an explicit five-row schedule matching train order.")
     if len(acoustic_records) != 8:
         raise ValueError("Dual PCGrad requires exactly eight acoustic protector rows.")
-    if len(behavior_records) != 2:
+    if protection_scope == "dual" and len(behavior_records) != 2:
         raise ValueError("Behavior protection requires exactly two pinned replay rows.")
+    if protection_scope == "formula_scoped" and behavior_records:
+        raise ValueError("Formula-scoped calibration must not optimize against behavior replay.")
     if validate_calibration_records(behavior_records):
         raise ValueError("Behavior protect rows must be ordinary replay rows, not calibration rows.")
     train_ids = {stable_sample_id(row) for row in records}
     behavior_ids = [stable_sample_id(row) for row in behavior_records]
-    if len(set(behavior_ids)) != 2 or train_ids.intersection(behavior_ids):
+    if len(set(behavior_ids)) != len(behavior_ids) or train_ids.intersection(behavior_ids):
         raise ValueError("Behavior protector IDs must be unique and disjoint from train rows.")
     if eos_loss_mode != "sequence_balanced":
         raise ValueError("Behavior protection requires sequence_balanced EOS loss.")
     if acoustic_weights[0] != 0 or not math.isclose(sum(acoustic_weights[1:]), 1.0):
         raise ValueError("Acoustic protection requires channel weights 0,1.")
-    if behavior_weights[0] != 1 or any(weight != 0 for weight in behavior_weights[1:]):
+    if protection_scope == "dual" and (
+        behavior_weights[0] != 1 or any(weight != 0 for weight in behavior_weights[1:])
+    ):
         raise ValueError("Behavior protection requires channel weights 1,0 (zero VQ loss).")
+    rounds = {row.get("on_policy_round", 1) for row in calibration}
+    source_shas = {row["prefix_generator_model_sha256"] for row in calibration}
+    if len(rounds) == 1 and next(iter(rounds)) >= 2:
+        if not expected_source_sha256 or source_shas != {expected_source_sha256}:
+            raise ValueError("Round-2 calibration source SHA must match the expected merged candidate SHA.")
+        source_revisions = {row["prefix_generator_revision"] for row in calibration}
+        if not expected_source_revision or source_revisions != {expected_source_revision}:
+            raise ValueError("Round-2 calibration revision must match the expected merged candidate revision.")
+
+
+def validate_round2_model_baseline(
+    records: List[Dict[str, Any]], model_path: str, *, expected_sha256: str, lora_rank: int,
+) -> None:
+    """Bind DAgger round-2 rows to a merged checkpoint and a fresh LoRA."""
+    calibration = validate_calibration_records(records)
+    if not calibration or min(row.get("on_policy_round", 1) for row in calibration) < 2:
+        return
+    if lora_rank <= 0:
+        raise ValueError("Round-2 calibration requires a fresh LoRA on the merged parent checkpoint.")
+    root = Path(model_path).expanduser().resolve()
+    if (root / "adapter_config.json").exists():
+        raise ValueError("Round-2 model path must be a merged parent, not a stacked LoRA adapter.")
+    weights = root / "pytorch_model.bin"
+    if not weights.is_file():
+        raise ValueError("Round-2 merged parent must contain authoritative pytorch_model.bin weights.")
+    digest = hashlib.sha256()
+    with weights.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    actual = digest.hexdigest()
+    if not expected_sha256 or actual != expected_sha256:
+        raise ValueError(
+            f"Round-2 model SHA mismatch: expected {expected_sha256 or '<missing>'}, actual {actual}."
+        )
 
 
 def build_optimizer(model, args: argparse.Namespace) -> AdamW:
@@ -802,6 +862,7 @@ def main() -> None:
     attn_implementation = resolve_attn_implementation(args.attn_implementation, model_dtype)
     records_paths, records = load_jsonl_spec(args.train_jsonl)
     records, train_schedule = apply_train_schedule(records, args.train_schedule_json)
+    validate_calibration_protection_enabled(records, pcgrad=args.pcgrad)
     protect_records_paths, protect_records = (load_jsonl_spec(args.protect_jsonl) if args.pcgrad else ([], []))
     behavior_records_paths, behavior_records = (
         load_jsonl_spec(args.behavior_protect_jsonl) if args.behavior_protect_jsonl else ([], [])
@@ -811,6 +872,12 @@ def main() -> None:
             "Scheduled training requires max_train_steps to equal the schedule length "
             f"({len(train_schedule)}), got {args.max_train_steps}."
         )
+
+    validate_round2_model_baseline(
+        records, args.model_path,
+        expected_sha256=args.calibration_source_model_sha256,
+        lora_rank=args.lora_rank,
+    )
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
     if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
@@ -907,6 +974,9 @@ def main() -> None:
             acoustic_weights=protect_channelwise_loss_weight,
             behavior_weights=behavior_protect_channelwise_loss_weight,
             eos_loss_mode=args.eos_loss_mode, train_schedule=train_schedule,
+            protection_scope=args.calibration_protection_scope,
+            expected_source_sha256=args.calibration_source_model_sha256,
+            expected_source_revision=args.calibration_source_revision,
         )
 
     lr_scheduler = get_scheduler(

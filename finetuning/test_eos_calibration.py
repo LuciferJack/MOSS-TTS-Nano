@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import tempfile
 from copy import deepcopy
 from types import SimpleNamespace
 import unittest
 
 from finetuning.dataset import MossTTSNanoSFTDataset
 from finetuning.eos_calibration import validate_calibration_record, validate_calibration_records
-from finetuning.sft import validate_calibration_objective
+from finetuning.sft import (
+    validate_calibration_objective, validate_calibration_protection_enabled,
+    validate_round2_model_baseline,
+)
 
 
 class CharacterTokenizer:
@@ -137,6 +141,12 @@ class EOSCalibrationTest(unittest.TestCase):
             with self.subTest(mode=mode, weights=weights), self.assertRaises(ValueError):
                 validate_calibration_objective(rows, eos_loss_mode=mode, channelwise_loss_weight=weights)
 
+    def test_calibration_cannot_run_without_pcgrad(self):
+        with self.assertRaisesRegex(ValueError, "requires --pcgrad"):
+            validate_calibration_protection_enabled([calibration_row()], pcgrad=False)
+        validate_calibration_protection_enabled([calibration_row()], pcgrad=True)
+        validate_calibration_protection_enabled([{"id": "ordinary"}], pcgrad=False)
+
     def test_provenance_and_boundary_fail_closed(self):
         mutations = [
             lambda row: row.pop("id"),
@@ -151,6 +161,7 @@ class EOSCalibrationTest(unittest.TestCase):
             lambda row: row["ref_audio_codes"][0].__setitem__(0, 99),
             lambda row: row["prefix_voice_reference_provenance"].__setitem__("audio_codes_sha256", "0" * 64),
             lambda row: row.pop("prefix_generator_revision"),
+            lambda row: row.__setitem__("on_policy_round", 4),
             lambda row: row["target_boundary_provenance"].pop("authorization"),
         ]
         for mutate in mutations:
@@ -172,6 +183,43 @@ class EOSCalibrationTest(unittest.TestCase):
         row = calibration_row()
         with self.assertRaisesRegex(ValueError, "Duplicate calibration"):
             validate_calibration_records([row, deepcopy(row)])
+
+    def test_round2_lineage_and_fresh_merged_baseline_are_fail_closed(self):
+        row = calibration_row()
+        row.update({
+            "on_policy_round": 2,
+            "parent_candidate_sha256": row["prefix_generator_model_sha256"],
+            "adapter_initialization": "fresh_on_merged_parent",
+        })
+        validate_calibration_record(row)
+        for field, value in (
+            ("parent_candidate_sha256", "b" * 64),
+            ("adapter_initialization", "stack_existing_adapter"),
+        ):
+            broken = deepcopy(row)
+            broken[field] = value
+            with self.assertRaises(ValueError):
+                validate_calibration_record(broken)
+
+        with tempfile.TemporaryDirectory() as directory:
+            weights = b"merged-round-one-candidate"
+            path = __import__("pathlib").Path(directory)
+            (path / "pytorch_model.bin").write_bytes(weights)
+            digest = hashlib.sha256(weights).hexdigest()
+            row["prefix_generator_model_sha256"] = digest
+            row["parent_candidate_sha256"] = digest
+            validate_round2_model_baseline([row], directory, expected_sha256=digest, lora_rank=8)
+            with self.assertRaisesRegex(ValueError, "SHA mismatch"):
+                validate_round2_model_baseline([row], directory, expected_sha256="0" * 64, lora_rank=8)
+            with self.assertRaisesRegex(ValueError, "fresh LoRA"):
+                validate_round2_model_baseline([row], directory, expected_sha256=digest, lora_rank=0)
+            (path / "adapter_config.json").write_text("{}", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "stacked"):
+                validate_round2_model_baseline([row], directory, expected_sha256=digest, lora_rank=8)
+
+            (path / "adapter_config.json").unlink()
+            row["on_policy_round"] = 3
+            validate_round2_model_baseline([row], directory, expected_sha256=digest, lora_rank=8)
 
 
 if __name__ == "__main__":

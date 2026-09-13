@@ -141,6 +141,41 @@ class ProtectedGradientTests(unittest.TestCase):
                 behavior_weights=[1, 0, 0], eos_loss_mode="sequence_balanced", train_schedule=[],
             )
 
+        validate_behavior_protection(
+            train, acoustic, [], acoustic_weights=[0, 0.5, 0.5],
+            behavior_weights=[1, 0, 0], eos_loss_mode="sequence_balanced",
+            train_schedule=[row["id"] for row in train], protection_scope="formula_scoped",
+        )
+        with self.assertRaisesRegex(ValueError, "must not optimize"):
+            validate_behavior_protection(
+                train, acoustic, behavior, acoustic_weights=[0, 0.5, 0.5],
+                behavior_weights=[1, 0, 0], eos_loss_mode="sequence_balanced",
+                train_schedule=[row["id"] for row in train], protection_scope="formula_scoped",
+            )
+
+    def test_round2_source_revision_and_sha_are_exact(self):
+        train = []
+        for index in range(5):
+            row = calibration_row()
+            row.update({"id": f"r2-{index}", "on_policy_round": 2,
+                        "parent_candidate_sha256": "a" * 64,
+                        "adapter_initialization": "fresh_on_merged_parent"})
+            train.append(row)
+        acoustic = [{"id": f"a-{i}", "text": "保护", "audio_codes": [[1, 2]]} for i in range(8)]
+        kwargs = dict(acoustic_weights=[0, .5, .5], behavior_weights=[1, 0, 0],
+                      eos_loss_mode="sequence_balanced", train_schedule=[r["id"] for r in train],
+                      protection_scope="formula_scoped", expected_source_sha256="a" * 64,
+                      expected_source_revision="moss-nano@c55e552")
+        validate_behavior_protection(train, acoustic, [], **kwargs)
+        for key in ("expected_source_sha256", "expected_source_revision"):
+            broken = dict(kwargs)
+            broken[key] = "0" * 64 if key.endswith("sha256") else "wrong-revision"
+            with self.assertRaises(ValueError):
+                validate_behavior_protection(train, acoustic, [], **broken)
+        for row in train:
+            row["on_policy_round"] = 3
+        validate_behavior_protection(train, acoustic, [], **kwargs)
+
     def test_training_backward_does_not_apply_protector_only_parameters(self):
         teacher_parameter = torch.nn.Parameter(torch.tensor(0.0))
         protector_parameter = torch.nn.Parameter(torch.tensor(0.0))
