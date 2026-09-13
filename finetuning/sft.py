@@ -735,6 +735,8 @@ def main() -> None:
                                 "learning_rate": lr_val,
                                 "channel_loss": gathered_channels,
                                 "gradient_norm_pre_clip": gradient_norms or {},
+                                "teacher_sample_ids": list(batch.get("sample_ids", [])) if args.pcgrad else None,
+                                "protector_sample_ids": list(protect_batch.get("sample_ids", [])) if args.pcgrad else None,
                                 "pcgrad": None if projection_report is None else {
                                     "iterations": projection_report.iterations,
                                     "original_minimum_dot": projection_report.original_minimum_dot,

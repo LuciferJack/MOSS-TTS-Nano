@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Any, Dict, Iterable, List, Optional
 
 import torch
@@ -20,6 +22,14 @@ OPTIONAL_MESSAGE_FIELDS = (
     ("ambient_sound", "Ambient Sound"),
     ("language", "Language"),
 )
+
+
+def stable_sample_id(record: Dict[str, Any]) -> str:
+    if record.get("id"):
+        return str(record["id"])
+    identity = {key: record.get(key) for key in ("text", "audio_codes", "ref_audio_codes")}
+    encoded = json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    return "anon-" + hashlib.sha256(encoded).hexdigest()[:16]
 
 
 def encode_text(tokenizer, text: str) -> List[int]:
@@ -83,10 +93,10 @@ class MossTTSNanoSFTDataset(Dataset):
     def __len__(self) -> int:
         return len(self.records)
 
-    def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
+    def __getitem__(self, index: int) -> Dict[str, Any]:
         return self._build_example(self.records[index], index=index)
 
-    def _build_example(self, record: Dict[str, Any], *, index: int) -> Dict[str, torch.Tensor]:
+    def _build_example(self, record: Dict[str, Any], *, index: int) -> Dict[str, Any]:
         if "text" not in record or not str(record["text"]).strip():
             raise ValueError(f"Record {index} is missing a non-empty `text` field.")
         if "audio_codes" not in record:
@@ -122,12 +132,13 @@ class MossTTSNanoSFTDataset(Dataset):
             raise ValueError(f"Record {index} packed sequence is too short: {seq_len}.")
 
         return {
+            "sample_id": stable_sample_id(record),
             "full_input_ids": full_sequence,
             "seq_len": torch.tensor(seq_len, dtype=torch.long),
             "prompt_length": torch.tensor(prompt_length, dtype=torch.long),
         }
 
-    def collate_fn(self, batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+    def collate_fn(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         batch_size = len(batch)
         row_width = self.model_config.n_vq + 1
 
@@ -158,6 +169,7 @@ class MossTTSNanoSFTDataset(Dataset):
         )
 
         return {
+            "sample_ids": [str(item["sample_id"]) for item in batch],
             "input_ids": full_input_ids[:, :-1, :].contiguous(),
             "attention_mask": full_attention_mask[:, :-1].contiguous(),
             "labels": labels.contiguous(),
