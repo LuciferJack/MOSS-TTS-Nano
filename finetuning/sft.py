@@ -104,6 +104,15 @@ def parse_args() -> argparse.Namespace:
         "--protect-channelwise-loss-weight", type=str, default="0,1",
         help="Loss weights for the PCGrad preservation batch; defaults to acoustic-only protection.",
     )
+    parser.add_argument(
+        "--eos-loss-weight",
+        type=float,
+        default=1.0,
+        help=(
+            "Relative weight for the single audio-end target in the text channel. "
+            "The default 1.0 is exactly the legacy mean cross-entropy objective."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--lora-rank", type=int, default=0, help="Enable LoRA when greater than zero.")
     parser.add_argument("--lora-alpha", type=int, default=16)
@@ -154,6 +163,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("`lora_rank` must be >= 0.")
     if args.lora_alpha <= 0:
         raise ValueError("`lora_alpha` must be > 0.")
+    if not math.isfinite(args.eos_loss_weight) or args.eos_loss_weight <= 0:
+        raise ValueError("`eos_loss_weight` must be finite and > 0.")
     if not 0.0 <= args.lora_dropout < 1.0:
         raise ValueError("`lora_dropout` must be in [0, 1).")
     if args.pcgrad and not args.protect_jsonl:
@@ -306,6 +317,51 @@ def unwrap_training_model(model):
     return unwrapped
 
 
+def compute_text_loss(
+    logits: torch.Tensor,
+    targets: torch.LongTensor,
+    *,
+    audio_end_token_id: int,
+    audio_assistant_slot_token_id: int,
+    eos_loss_weight: float = 1.0,
+) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """Compute text-channel CE while keeping continuation and stop observable.
+
+    A packed TTS target contains one assistant-slot text target per acoustic
+    frame followed by exactly one audio-end target.  A plain mean therefore
+    gives the stopping decision only 1/(frames + 1) of the text objective.
+    Weighting is deliberately based only on the target token ID; audio/VQ
+    logits and losses never enter this helper.
+    """
+    valid = targets.ne(-100)
+    if not valid.any():
+        raise ValueError("Text loss requires at least one non-ignored target.")
+    if not math.isfinite(eos_loss_weight) or eos_loss_weight <= 0:
+        raise ValueError("`eos_loss_weight` must be finite and > 0.")
+
+    per_token = F.cross_entropy(logits.float(), targets, ignore_index=-100, reduction="none")
+    stop = valid & targets.eq(int(audio_end_token_id))
+    continuation = valid & ~stop
+    weights = valid.to(dtype=per_token.dtype)
+    weights = torch.where(stop, weights * float(eos_loss_weight), weights)
+    loss = (per_token * weights).sum() / weights.sum()
+    # Runtime termination is a binary decision between continuing with the
+    # assistant slot and stopping with audio_end. Report that exact decision.
+    slot_logits = logits[:, int(audio_assistant_slot_token_id)].float()
+    stop_logits = logits[:, int(audio_end_token_id)].float()
+
+    nan = torch.full((), float("nan"), device=logits.device, dtype=torch.float32)
+    breakdown: Dict[str, torch.Tensor] = {}
+    for name, mask in (("text_continue", continuation), ("text_stop", stop)):
+        breakdown[f"{name}_loss"] = per_token[mask].mean().detach().float() if mask.any() else nan
+        correct = slot_logits.gt(stop_logits) if name == "text_continue" else stop_logits.gt(slot_logits)
+        signed_margin = slot_logits - stop_logits if name == "text_continue" else stop_logits - slot_logits
+        breakdown[f"{name}_accuracy"] = correct[mask].float().mean().detach() if mask.any() else nan
+        breakdown[f"{name}_margin"] = signed_margin[mask].mean().detach() if mask.any() else nan
+        breakdown[f"{name}_count"] = mask.sum().detach().float()
+    return loss, breakdown
+
+
 def compute_supervised_loss(
     model,
     *,
@@ -313,6 +369,7 @@ def compute_supervised_loss(
     attention_mask: torch.BoolTensor,
     labels: torch.LongTensor,
     channelwise_loss_weight: List[float],
+    eos_loss_weight: float = 1.0,
     return_breakdown: bool = False,
 ):
     outputs = model(
@@ -379,13 +436,31 @@ def compute_supervised_loss(
     # must execute the same number and order of gather collectives.
     channel_losses: Dict[str, torch.Tensor] = {
         name: torch.full((), float("nan"), device=flat_hidden.device, dtype=torch.float32)
-        for name in ("text", *(f"vq{index}" for index in range(n_vq)))
+        for name in (
+            "text",
+            "text_continue_loss",
+            "text_stop_loss",
+            "text_continue_accuracy",
+            "text_stop_accuracy",
+            "text_continue_margin",
+            "text_stop_margin",
+            "text_continue_count",
+            "text_stop_count",
+            *(f"vq{index}" for index in range(n_vq)),
+        )
     }
 
     text_logits = base_model.text_lm_head(local_hidden_states[:, 0, :])
     if (text_targets != -100).any():
-        text_loss = F.cross_entropy(text_logits.float(), text_targets, ignore_index=-100)
+        text_loss, text_breakdown = compute_text_loss(
+            text_logits,
+            text_targets,
+            audio_end_token_id=int(base_model.config.audio_end_token_id),
+            audio_assistant_slot_token_id=int(base_model.config.audio_assistant_slot_token_id),
+            eos_loss_weight=eos_loss_weight,
+        )
         channel_losses["text"] = text_loss.detach().float()
+        channel_losses.update(text_breakdown)
         total_loss = total_loss + float(channelwise_loss_weight[0]) * text_loss.float()
         total_weight += float(channelwise_loss_weight[0])
 
@@ -679,6 +754,7 @@ def main() -> None:
                     attention_mask=batch["attention_mask"],
                     labels=batch["labels"],
                     channelwise_loss_weight=channelwise_loss_weight,
+                    eos_loss_weight=args.eos_loss_weight,
                     return_breakdown=True,
                 )
                 projection_report = None
@@ -696,6 +772,7 @@ def main() -> None:
                         attention_mask=protect_batch["attention_mask"],
                         labels=protect_batch["labels"],
                         channelwise_loss_weight=protect_channelwise_loss_weight,
+                        eos_loss_weight=args.eos_loss_weight,
                     )
                     projection_report = pcgrad_backward(
                         accelerator=accelerator,

@@ -125,7 +125,12 @@ class MossTTSNanoSFTDataset(Dataset):
             )
 
         if full_sequence.shape[0] > self.max_length:
-            full_sequence = full_sequence[: self.max_length]
+            raise ValueError(
+                f"Record {index} requires sequence length {full_sequence.shape[0]} "
+                f"(prompt={prompt_length}, audio_frames={target_codes.shape[0]}, stop=1), "
+                f"which exceeds max_length={self.max_length}. Refusing to truncate the "
+                "audio_end supervision target; increase --max-length or shorten the sample."
+            )
 
         seq_len = int(full_sequence.shape[0])
         if seq_len < 2:

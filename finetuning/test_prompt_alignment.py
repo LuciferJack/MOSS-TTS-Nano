@@ -60,6 +60,14 @@ class PromptAlignmentTest(unittest.TestCase):
         self.assertEqual(dataset[0]["sample_id"], dataset[1]["sample_id"])
         self.assertTrue(dataset[0]["sample_id"].startswith("anon-"))
 
+    def test_target_that_would_lose_audio_end_fails_closed(self):
+        dataset = MossTTSNanoSFTDataset(
+            [{"id": "too-long", "text": "第一步", "audio_codes": [[1, 2]] * 200}],
+            tokenizer=CharacterTokenizer(), model_config=self.config(), max_length=256,
+        )
+        with self.assertRaisesRegex(ValueError, "Refusing to truncate the audio_end"):
+            dataset[0]
+
 
 if __name__ == "__main__":
     unittest.main()
