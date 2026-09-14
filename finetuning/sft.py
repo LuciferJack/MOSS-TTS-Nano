@@ -1245,16 +1245,16 @@ def main() -> None:
         num_training_steps=max_train_steps,
     )
     if protect_dataloader is None:
-        model, content_head, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-            model, content_head, optimizer, train_dataloader, lr_scheduler,
+        model, content_head, speaker_conditioner, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            model, content_head, speaker_conditioner, optimizer, train_dataloader, lr_scheduler,
         )
     elif behavior_protect_dataloader is None:
-        model, content_head, optimizer, train_dataloader, protect_dataloader, lr_scheduler = accelerator.prepare(
-            model, content_head, optimizer, train_dataloader, protect_dataloader, lr_scheduler,
+        model, content_head, speaker_conditioner, optimizer, train_dataloader, protect_dataloader, lr_scheduler = accelerator.prepare(
+            model, content_head, speaker_conditioner, optimizer, train_dataloader, protect_dataloader, lr_scheduler,
         )
     else:
-        model, content_head, optimizer, train_dataloader, protect_dataloader, behavior_protect_dataloader, lr_scheduler = accelerator.prepare(
-            model, content_head, optimizer, train_dataloader, protect_dataloader, behavior_protect_dataloader, lr_scheduler,
+        model, content_head, speaker_conditioner, optimizer, train_dataloader, protect_dataloader, behavior_protect_dataloader, lr_scheduler = accelerator.prepare(
+            model, content_head, speaker_conditioner, optimizer, train_dataloader, protect_dataloader, behavior_protect_dataloader, lr_scheduler,
         )
 
     output_root = Path(args.output_dir)
