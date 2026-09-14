@@ -27,6 +27,7 @@ if str(REPO_ROOT) not in sys.path:
 from finetuning.common import format_duration, format_timestamp, load_jsonl_spec
 from finetuning.dataset import MossTTSNanoSFTDataset, stable_sample_id
 from finetuning.eos_calibration import validate_calibration_records
+from finetuning.joint_formula_sft import validate_joint_formula_pilot
 from finetuning.protected_gradient import is_feasible_dot, project_teacher_gradient
 
 DEFAULT_MODEL_PATH = REPO_ROOT / "models" / "MOSS-TTS-Nano"
@@ -169,6 +170,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--calibration-source-revision", default="",
         help="Expected immutable generator revision; mandatory for round-2 calibration.",
+    )
+    parser.add_argument(
+        "--joint-formula-pilot", action="store_true",
+        help="Enable the fail-closed five-row joint text+codec formula pilot.",
     )
     return parser.parse_args()
 
@@ -967,6 +972,15 @@ def main() -> None:
     validate_calibration_objective(
         records, eos_loss_mode=args.eos_loss_mode,
         channelwise_loss_weight=channelwise_loss_weight,
+    )
+    validate_joint_formula_pilot(
+        records, protect_records, enabled=args.joint_formula_pilot, pcgrad=args.pcgrad,
+        protection_scope=args.calibration_protection_scope, behavior_rows=behavior_records,
+        eos_loss_mode=args.eos_loss_mode, channel_weights=channelwise_loss_weight,
+        acoustic_weights=protect_channelwise_loss_weight, schedule=train_schedule,
+        max_train_steps=args.max_train_steps, lora_rank=args.lora_rank,
+        model_path=args.model_path, lora_target_modules=args.lora_target_modules,
+        lora_modules_to_save=args.lora_modules_to_save,
     )
     if args.pcgrad:
         validate_behavior_protection(
