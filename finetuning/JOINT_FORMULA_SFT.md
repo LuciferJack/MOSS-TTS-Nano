@@ -26,8 +26,9 @@ text, 33.33% acoustic total, and 2.083% per VQ. No intermediate or larger weight
 is accepted, and every other setting remains identical to v1.
 
 v3 does not raise the acoustic total again. It keeps `1,0.5` and changes only
-the within-sample frame allocation: every authorized row must declare an
-`acoustic_tail_start_frame` satisfying `0 < boundary < T`. For each of the 16
+the within-sample frame allocation. Every authorized row explicitly declares
+`acoustic_tail_mode=aligned_weighted|legacy_unweighted`. An aligned row must
+declare `acoustic_tail_start_frame` satisfying `0 < boundary < T`. For each of the 16
 VQ heads the trainer computes unreduced CE, weights body frames 1 and tail
 frames 2, then uses `sum(weight * CE) / sum(weight)` per sample before averaging
 samples. Padding and the text EOS position are excluded. Without the explicit
@@ -43,10 +44,16 @@ unreviewed increase to acoustic weight.
 The independent teacher alignment report is also mandatory through
 `--joint-formula-alignment-report{,-sha256}`. Each row records that report hash,
 the two-method interval, `policy=conservative_lower_bound`, the selected lower
-frame, and uncertainty in frames. Interval width greater than one frame is
-rejected. The audited Cu pentahydrate evidence is report SHA-256
-`0f8dfadf0b1ab69d969141c41801ec5397119778ab7f152f072029bc0498a401`,
-interval `[52,53]`, selected frame `52`, uncertainty `1`.
+frame, and uncertainty in frames. `aligned_weighted` accepts width at most one,
+including a report-level fail-closed verdict caused by unstable sub-frame ASR,
+and conservatively selects the lower frame. `legacy_unweighted` requires width
+greater than one, `reason=alignment_uncertain`, no selected frame and no boundary;
+that row retains ordinary unweighted CE. Missing or invented modes are rejected.
+The bound v2 alignment report SHA-256 is
+`50436f3037b4d457307f41f470fa12106d02985d106651d3b8830348f77c234e`.
+Its mixed plan is: dihydrate 55, decahydrate 44, and pentahydrate `[52,53] -> 52`
+aligned-weighted; heptahydrate `[48,50]` and hexahydrate `[58,61]`
+legacy-unweighted.
 
 Use exactly five scheduled optimizer steps, batch 1, accumulation 1, then stop
 and evaluate. Do not silently add epochs. Early reject immediately on non-finite

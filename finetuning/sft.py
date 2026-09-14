@@ -628,6 +628,7 @@ def compute_tail_weighted_channel_loss(
     seq_len: int,
     acoustic_frame_indices: torch.LongTensor,
     acoustic_tail_start_frames: torch.LongTensor,
+    acoustic_tail_weighted_mask: Optional[torch.BoolTensor] = None,
 ) -> torch.Tensor:
     """Return a sample-balanced body:tail 1:2 CE for one VQ head."""
     if tuple(acoustic_frame_indices.shape) != (batch_size, seq_len):
@@ -640,7 +641,13 @@ def compute_tail_weighted_channel_loss(
     valid = channel_targets.reshape(batch_size, seq_len).ne(-100)
     frame_indices = acoustic_frame_indices.to(device=per_token.device)
     boundaries = acoustic_tail_start_frames.to(device=per_token.device)
-    weights = torch.where(frame_indices >= boundaries[:, None], 2.0, 1.0) * valid
+    weighted_mask = (torch.ones(batch_size, dtype=torch.bool, device=per_token.device)
+                     if acoustic_tail_weighted_mask is None
+                     else acoustic_tail_weighted_mask.to(device=per_token.device))
+    if tuple(weighted_mask.shape) != (batch_size,):
+        raise ValueError("One acoustic tail mode is required per sample.")
+    tail = weighted_mask[:, None] & (frame_indices >= boundaries[:, None])
+    weights = torch.where(tail, 2.0, 1.0) * valid
     denominators = weights.sum(dim=1)
     if (denominators <= 0).any():
         raise ValueError("Every tail-weighted sample must contain acoustic targets.")
@@ -658,6 +665,7 @@ def compute_supervised_loss(
     eos_loss_mode: str = "token_weight",
     acoustic_frame_indices: Optional[torch.LongTensor] = None,
     acoustic_tail_start_frames: Optional[torch.LongTensor] = None,
+    acoustic_tail_weighted_mask: Optional[torch.BoolTensor] = None,
     return_breakdown: bool = False,
 ):
     outputs = model(
@@ -769,6 +777,7 @@ def compute_supervised_loss(
                 channel_logits, channel_targets, batch_size=batch_size, seq_len=seq_len,
                 acoustic_frame_indices=acoustic_frame_indices,
                 acoustic_tail_start_frames=acoustic_tail_start_frames,
+                acoustic_tail_weighted_mask=acoustic_tail_weighted_mask,
             )
         channel_losses[f"vq{channel_index}"] = channel_loss.detach().float()
         total_loss = total_loss + float(channelwise_loss_weight[channel_index + 1]) * channel_loss.float()
@@ -918,9 +927,10 @@ def main() -> None:
     attn_implementation = resolve_attn_implementation(args.attn_implementation, model_dtype)
     records_paths, records = load_jsonl_spec(args.train_jsonl)
     records, train_schedule = apply_train_schedule(records, args.train_schedule_json)
-    has_tail_boundaries = any(record.get("acoustic_tail_start_frame") is not None for record in records)
-    if has_tail_boundaries and not args.joint_formula_tail_weighting:
-        raise ValueError("acoustic_tail_start_frame requires explicit --joint-formula-tail-weighting.")
+    has_tail_contract = any(record.get("acoustic_tail_mode") is not None
+                            or record.get("acoustic_tail_start_frame") is not None for record in records)
+    if has_tail_contract and not args.joint_formula_tail_weighting:
+        raise ValueError("Acoustic tail fields require explicit --joint-formula-tail-weighting.")
     if args.joint_formula_tail_weighting and not args.joint_formula_pilot:
         raise ValueError("--joint-formula-tail-weighting requires --joint-formula-pilot.")
     validate_calibration_protection_enabled(records, pcgrad=args.pcgrad)
@@ -1132,6 +1142,8 @@ def main() -> None:
                     acoustic_frame_indices=(batch.get("acoustic_frame_indices")
                                             if args.joint_formula_tail_weighting else None),
                     acoustic_tail_start_frames=(batch.get("acoustic_tail_start_frames")
+                                                if args.joint_formula_tail_weighting else None),
+                    acoustic_tail_weighted_mask=(batch.get("acoustic_tail_weighted_mask")
                                                 if args.joint_formula_tail_weighting else None),
                     return_breakdown=True,
                 )

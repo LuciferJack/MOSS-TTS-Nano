@@ -15,6 +15,7 @@ ACOUSTIC_PROTECT_ROWS = 8
 PILOT_AUDIO_TOTAL_WEIGHTS = (0.125, 0.5)
 PILOT_N_VQ = 16
 GLOBAL_LORA_TARGETS = r"^transformer\.h\.\d+\.(attn\.(c_attn|c_proj)|mlp\.(c_fc|c_proj))$"
+ALIGNMENT_V2_SHA256 = "50436f3037b4d457307f41f470fa12106d02985d106651d3b8830348f77c234e"
 
 
 def _canonical_sha(value: Any) -> str:
@@ -139,14 +140,17 @@ def validate_joint_formula_pilot(
     elif prior_report_path or prior_report_sha256:
         raise ValueError("0.125 baseline pilot must not claim a prior failure artifact.")
     tail_boundaries = [row.get("acoustic_tail_start_frame") for row in selected]
+    tail_modes = [row.get("acoustic_tail_mode") for row in selected]
     tail_artifacts = (v2_fail_report_path, v2_fail_report_sha256, trace_audit_path, trace_audit_sha256,
                       alignment_report_path, alignment_report_sha256)
     if tail_weighting:
-        if allowed_total != 0.5 or any(boundary is None for boundary in tail_boundaries):
-            raise ValueError("v3 tail weighting requires audio total 0.5 and one valid boundary per row.")
+        if allowed_total != 0.5 or any(mode not in ("aligned_weighted", "legacy_unweighted") for mode in tail_modes):
+            raise ValueError("v3 requires audio total 0.5 and one explicit supported mode per row.")
         v2_path = Path(v2_fail_report_path).expanduser()
         audit_path = Path(trace_audit_path).expanduser()
         alignment_path = Path(alignment_report_path).expanduser()
+        if alignment_report_sha256 != ALIGNMENT_V2_SHA256:
+            raise ValueError("v3 requires the reviewed v2 teacher alignment report SHA-256.")
         for name, path, supplied_sha in (
             ("v2 FAIL report", v2_path, v2_fail_report_sha256),
             ("v1/v2 trace audit", audit_path, trace_audit_sha256),
@@ -171,28 +175,44 @@ def validate_joint_formula_pilot(
             alignment = json.loads(alignment_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             raise ValueError("Teacher alignment report must be valid UTF-8 JSON.") from exc
-        if alignment.get("schema") != "joint-teacher-tail-alignment-audit-v1":
+        if alignment.get("schema") != "joint-teacher-tail-alignment-audit-v2":
             raise ValueError("Unexpected teacher alignment report schema.")
-        alignment_rows = {row.get("id"): row for row in alignment.get("rows", [])}
+        alignment_rows = {item.get("id"): item for item in alignment.get("rows", [])}
+        for item in alignment.get("unchanged_high_confidence_from_v1", []):
+            alignment_rows[item.get("id")] = {
+                "id": item.get("id"), "audio_frames": next(
+                    (len(row["audio_codes"]) for row in selected if row["id"] == item.get("id")), None
+                ), "candidate_interval_frames": [item.get("frame"), item.get("frame")],
+                "interval_width_frames": 0,
+            }
         for row in selected:
             evidence = row.get("acoustic_tail_alignment")
             report_row = alignment_rows.get(row["id"])
             if not isinstance(evidence, dict) or not isinstance(report_row, dict):
                 raise ValueError(f"Joint row {row['id']} requires alignment evidence.")
-            interval = report_row.get("boundary_interval_frames")
+            interval = report_row.get("candidate_interval_frames")
             if (not isinstance(interval, list) or len(interval) != 2
                     or any(isinstance(value, bool) or not isinstance(value, int) for value in interval)
-                    or interval[0] > interval[1] or interval[1] - interval[0] > 1):
-                raise ValueError(f"Joint row {row['id']} alignment uncertainty exceeds one frame.")
-            if (evidence.get("report_sha256") != alignment_report_sha256
-                    or evidence.get("policy") != "conservative_lower_bound"
+                    or interval[0] > interval[1]):
+                raise ValueError(f"Joint row {row['id']} has invalid alignment interval.")
+            width = interval[1] - interval[0]
+            mode = row["acoustic_tail_mode"]
+            common_mismatch = (evidence.get("report_sha256") != alignment_report_sha256
                     or evidence.get("boundary_interval_frames") != interval
-                    or evidence.get("selected_frame") != interval[0]
-                    or evidence.get("uncertainty_frames") != interval[1] - interval[0]
-                    or row["acoustic_tail_start_frame"] != interval[0]
-                    or report_row.get("audio_frames") != len(row["audio_codes"])):
+                    or evidence.get("uncertainty_frames") != width
+                    or report_row.get("audio_frames") != len(row["audio_codes"]))
+            if common_mismatch:
                 raise ValueError(f"Joint row {row['id']} alignment evidence does not bind the report.")
-    elif any(boundary is not None for boundary in tail_boundaries) or any(tail_artifacts):
+            if mode == "aligned_weighted":
+                if (width > 1 or evidence.get("policy") != "conservative_lower_bound"
+                        or evidence.get("selected_frame") != interval[0]
+                        or row.get("acoustic_tail_start_frame") != interval[0]):
+                    raise ValueError(f"Joint row {row['id']} aligned mode requires width<=1 and selected lower bound.")
+            elif (width <= 1 or evidence.get("reason") != "alignment_uncertain"
+                  or evidence.get("selected_frame") is not None
+                  or row.get("acoustic_tail_start_frame") is not None):
+                raise ValueError(f"Joint row {row['id']} legacy mode requires uncertain width>1 and no boundary.")
+    elif any(boundary is not None for boundary in tail_boundaries) or any(mode is not None for mode in tail_modes) or any(tail_artifacts):
         raise ValueError("Tail boundaries/artifacts require explicit v3 tail weighting.")
     if acoustic_weights[0] != 0 or not math.isclose(sum(acoustic_weights[1:]), 1.0):
         raise ValueError("Acoustic protect objective must be 0,1.")

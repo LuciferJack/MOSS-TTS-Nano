@@ -4,6 +4,7 @@ from copy import deepcopy
 import hashlib
 import json
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -101,10 +102,12 @@ class JointFormulaSFTTest(unittest.TestCase):
 
     def test_v3_requires_68_frame_boundaries_and_hashed_evidence(self):
         train = rows()
-        for row in train:
+        for index, row in enumerate(train):
             row["audio_codes"] = [[index % 17] * 16 for index in range(68)]
             row["audio_codes_sha256"] = digest(row["audio_codes"])
-            row["acoustic_tail_start_frame"] = 34
+            row["acoustic_tail_mode"] = "aligned_weighted" if index < 3 else "legacy_unweighted"
+            if index < 3:
+                row["acoustic_tail_start_frame"] = 34
         with TemporaryDirectory() as directory:
             root = Path(directory)
             v1, v2, audit, alignment = root / "v1.json", root / "v2.json", root / "audit.md", root / "alignment.json"
@@ -112,17 +115,22 @@ class JointFormulaSFTTest(unittest.TestCase):
             v2_sha = write_report(v2, 0.5)
             audit.write_text("joint-v1-v2 trace audit\n", encoding="utf-8")
             alignment.write_text(json.dumps({
-                "schema": "joint-teacher-tail-alignment-audit-v1",
+                "schema": "joint-teacher-tail-alignment-audit-v2",
                 "rows": [{"id": row["id"], "audio_frames": 68,
-                          "boundary_interval_frames": [34, 35]} for row in train],
+                          "candidate_interval_frames": ([34, 35] if index < 3 else [34, 36]),
+                          "interval_width_frames": (1 if index < 3 else 2)}
+                         for index, row in enumerate(train)],
             }), encoding="utf-8")
             alignment_sha = hashlib.sha256(alignment.read_bytes()).hexdigest()
-            for row in train:
+            for index, row in enumerate(train):
                 row["acoustic_tail_alignment"] = {
                     "report_sha256": alignment_sha, "policy": "conservative_lower_bound",
-                    "boundary_interval_frames": [34, 35], "selected_frame": 34,
-                    "uncertainty_frames": 1,
+                    "boundary_interval_frames": ([34, 35] if index < 3 else [34, 36]),
+                    "selected_frame": (34 if index < 3 else None),
+                    "uncertainty_frames": (1 if index < 3 else 2),
                 }
+                if index >= 3:
+                    row["acoustic_tail_alignment"].update(reason="alignment_uncertain")
             options = kwargs(train)
             options.update(
                 channel_weights=[1] + [0.5 / 16] * 16,
@@ -133,7 +141,8 @@ class JointFormulaSFTTest(unittest.TestCase):
                 trace_audit_sha256=hashlib.sha256(audit.read_bytes()).hexdigest(),
                 alignment_report_path=str(alignment), alignment_report_sha256=alignment_sha,
             )
-            validate_joint_formula_pilot(train, [{"id": i} for i in range(8)], **options)
+            with patch("finetuning.joint_formula_sft.ALIGNMENT_V2_SHA256", alignment_sha):
+                validate_joint_formula_pilot(train, [{"id": i} for i in range(8)], **options)
             for value in (0, 68, True, None):
                 broken_rows = deepcopy(train)
                 if value is None:
@@ -141,23 +150,47 @@ class JointFormulaSFTTest(unittest.TestCase):
                 else:
                     broken_rows[0]["acoustic_tail_start_frame"] = value
                 with self.assertRaises(ValueError):
-                    validate_joint_formula_pilot(
-                        broken_rows, [{"id": i} for i in range(8)], **{**options,
-                            "schedule": [row["id"] for row in broken_rows]}
-                    )
+                    with patch("finetuning.joint_formula_sft.ALIGNMENT_V2_SHA256", alignment_sha):
+                        validate_joint_formula_pilot(
+                            broken_rows, [{"id": i} for i in range(8)], **{**options,
+                                "schedule": [row["id"] for row in broken_rows]}
+                        )
             bad_hash = dict(options); bad_hash["trace_audit_sha256"] = "0" * 64
             with self.assertRaises(ValueError):
-                validate_joint_formula_pilot(train, [{"id": i} for i in range(8)], **bad_hash)
-            wide = json.loads(alignment.read_text())
-            wide["rows"][0]["boundary_interval_frames"] = [34, 36]
+                with patch("finetuning.joint_formula_sft.ALIGNMENT_V2_SHA256", alignment_sha):
+                    validate_joint_formula_pilot(train, [{"id": i} for i in range(8)], **bad_hash)
+            original_alignment = alignment.read_text()
+            wide = json.loads(original_alignment)
+            wide["rows"][0]["candidate_interval_frames"] = [34, 36]
             alignment.write_text(json.dumps(wide), encoding="utf-8")
             wide_sha = hashlib.sha256(alignment.read_bytes()).hexdigest()
             train[0]["acoustic_tail_alignment"].update(
                 report_sha256=wide_sha, boundary_interval_frames=[34, 36], uncertainty_frames=2
             )
             wide_options = dict(options, alignment_report_sha256=wide_sha)
-            with self.assertRaisesRegex(ValueError, "exceeds one frame"):
-                validate_joint_formula_pilot(train, [{"id": i} for i in range(8)], **wide_options)
+            with self.assertRaisesRegex(ValueError, "width<=1"):
+                with patch("finetuning.joint_formula_sft.ALIGNMENT_V2_SHA256", wide_sha):
+                    validate_joint_formula_pilot(train, [{"id": i} for i in range(8)], **wide_options)
+            alignment.write_text(original_alignment)
+            train[0]["acoustic_tail_alignment"].update(
+                report_sha256=alignment_sha, boundary_interval_frames=[34, 35], uncertainty_frames=1
+            )
+
+            for mode in (None, "invented"):
+                broken_rows = deepcopy(train)
+                if mode is None:
+                    broken_rows[0].pop("acoustic_tail_mode")
+                else:
+                    broken_rows[0]["acoustic_tail_mode"] = mode
+                with self.assertRaises(ValueError):
+                    with patch("finetuning.joint_formula_sft.ALIGNMENT_V2_SHA256", alignment_sha):
+                        validate_joint_formula_pilot(broken_rows, [{"id": i} for i in range(8)], **options)
+
+            legacy_with_boundary = deepcopy(train)
+            legacy_with_boundary[3]["acoustic_tail_start_frame"] = 34
+            with self.assertRaisesRegex(ValueError, "legacy mode"):
+                with patch("finetuning.joint_formula_sft.ALIGNMENT_V2_SHA256", alignment_sha):
+                    validate_joint_formula_pilot(legacy_with_boundary, [{"id": i} for i in range(8)], **options)
 
     def test_boundary_without_explicit_v3_is_rejected(self):
         train = rows(); train[0]["acoustic_tail_start_frame"] = 1

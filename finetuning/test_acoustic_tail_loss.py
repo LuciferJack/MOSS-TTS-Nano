@@ -37,6 +37,20 @@ class AcousticTailLossTest(unittest.TestCase):
         expected = (losses[:2].sum() + 2 * losses[2:].sum()) / 6
         self.assertTrue(torch.allclose(actual, expected))
 
+    def test_mixed_legacy_row_uses_unweighted_ce(self):
+        logits = torch.tensor([[4.0, 0.0], [0.0, 4.0], [4.0, 0.0], [0.0, 4.0]])
+        targets = torch.zeros(4, dtype=torch.long)
+        indices = torch.tensor([[0, 1], [0, 1]])
+        actual = compute_tail_weighted_channel_loss(
+            logits, targets, batch_size=2, seq_len=2,
+            acoustic_frame_indices=indices,
+            acoustic_tail_start_frames=torch.tensor([1, -1]),
+            acoustic_tail_weighted_mask=torch.tensor([True, False]),
+        )
+        losses = F.cross_entropy(logits, targets, reduction="none").reshape(2, 2)
+        expected = torch.stack(((losses[0, 0] + 2 * losses[0, 1]) / 3, losses[1].mean())).mean()
+        self.assertTrue(torch.allclose(actual, expected))
+
     def test_bad_shapes_and_empty_sample_fail_closed(self):
         logits = torch.zeros(2, 2)
         targets = torch.full((2,), -100)

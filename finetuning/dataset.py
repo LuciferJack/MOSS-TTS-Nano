@@ -155,6 +155,7 @@ class MossTTSNanoSFTDataset(Dataset):
             "response_audio_frames": torch.tensor(int(target_codes.shape[0]), dtype=torch.long),
             "text_only_eos_calibration": calibration,
             "acoustic_tail_start_frame": record.get("acoustic_tail_start_frame"),
+            "acoustic_tail_mode": record.get("acoustic_tail_mode"),
         }
 
     def collate_fn(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -204,11 +205,15 @@ class MossTTSNanoSFTDataset(Dataset):
             "labels": labels.contiguous(),
             "acoustic_frame_indices": acoustic_frame_indices,
         }
-        if any(item.get("acoustic_tail_start_frame") is not None for item in batch):
-            if any(item.get("acoustic_tail_start_frame") is None for item in batch):
-                raise ValueError("Tail-weighted batches cannot mix configured and unconfigured samples.")
+        if any(item.get("acoustic_tail_mode") is not None for item in batch):
+            if any(item.get("acoustic_tail_mode") not in ("aligned_weighted", "legacy_unweighted") for item in batch):
+                raise ValueError("Every mixed-tail sample requires an explicit supported acoustic_tail_mode.")
             result["acoustic_tail_start_frames"] = torch.tensor(
-                [int(item["acoustic_tail_start_frame"]) for item in batch], dtype=torch.long
+                [int(item["acoustic_tail_start_frame"])
+                 if item["acoustic_tail_mode"] == "aligned_weighted" else -1 for item in batch], dtype=torch.long
+            )
+            result["acoustic_tail_weighted_mask"] = torch.tensor(
+                [item["acoustic_tail_mode"] == "aligned_weighted" for item in batch], dtype=torch.bool
             )
         return result
 
