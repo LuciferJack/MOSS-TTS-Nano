@@ -11,7 +11,8 @@ weighting experiment.
 - Train: exactly one approved Junhao professional utterance (`Ca(OH)2`).
 - Heldout: exactly one structurally different approved Junhao utterance
   (`CoCl2·6H2O`). It is evaluation-only and cannot appear in train or PCGrad.
-- Protection: exactly five natural Junhao utterances, acoustic-only PCGrad.
+- Protection: exactly four natural Junhao utterances (`a01`, `a02`, `a04`,
+  `a05`), acoustic-only PCGrad. `a03` is reference-only.
   No professional protector is allowed because it could leak heldout content.
 - Reference: one additional independent Junhao natural utterance. Its exact
   `ref_audio_codes` and hashes must be identical in train, heldout and protector
@@ -31,9 +32,9 @@ weighting experiment.
 ## Asset preflight status
 
 The immutable machine preflight is bound by SHA-256
-`dc8207757d9662a14ce64dfe533b0d0e434512133493d9541219004a598874fb`.
+`5e11c6e0165acaabdbcdd11bf5925b99baa7ef11b6110c072ec510b01e24c25c`.
 It binds the source manifest, A/B codec and gate artifacts, historical human
-ledger, independent `junhao_real_a03` reference, and five natural protectors.
+ledger, independent `junhao_real_a03` reference, and four natural protectors.
 The legacy `pass_user` string is never trusted as a gate. Training remains
 blocked until a new bundle embeds the exact reference codes and passes this
 validator.

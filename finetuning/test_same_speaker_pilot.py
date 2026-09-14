@@ -45,9 +45,10 @@ class SameSpeakerPilotTest(unittest.TestCase):
                             "hydrate-dot", self.ref_codes, self.ref_asset)]
         self.train[0]["text"] = TRAIN_TEXT
         self.heldout[0]["text"] = HELDOUT_TEXT
-        self.protect = [row(f"natural-{i}", "same_speaker_natural_protector", "natural",
-                            f"{i + 1:x}" * 64, f"natural-{i}", self.ref_codes, self.ref_asset)
-                        for i in range(5)]
+        protect_ids = ("junhao_real_a01", "junhao_real_a02", "junhao_real_a04", "junhao_real_a05")
+        self.protect = [row(identifier, "same_speaker_natural_protector", "natural",
+                            f"{i + 1:x}" * 64, identifier, self.ref_codes, self.ref_asset)
+                        for i, identifier in enumerate(protect_ids)]
         assets = [{"id": r["id"], "audio_sha256": r["audio_asset_sha256"],
                    "codec_codes_canonical_json_sha256": r["audio_codes_sha256"],
                    "source_gate_artifact_sha256": SOURCE_GATE_SHAS[r["id"]],
@@ -58,7 +59,7 @@ class SameSpeakerPilotTest(unittest.TestCase):
         natural = [{"id": r["id"], "audio_sha256": r["audio_asset_sha256"],
                     "codec_codes_sha256": r["audio_codes_sha256"]} for r in self.protect]
         self.gate = self.root / "manifest.json"
-        self.gate.write_text(json.dumps({"schema": "min-same-voice-causal-pilot-preflight-v1",
+        self.gate.write_text(json.dumps({"schema": "min-same-voice-causal-pilot-preflight-v2",
                                          "source_manifest_sha256": SOURCE_MANIFEST_SHA256,
                                          "assets": assets, "natural_pcgrad_only": natural}), encoding="utf-8")
         self.gate_sha = hashlib.sha256(self.gate.read_bytes()).hexdigest()
@@ -89,6 +90,7 @@ class SameSpeakerPilotTest(unittest.TestCase):
         self.assertNotIn(contract["heldout_id"], contract["protector_ids"])
         self.assertEqual(contract["reference_id"], "junhao_real_a03")
         self.assertEqual(self.validate(max_train_steps=2)["candidate_steps"], [1, 2])
+        self.validate(protect=list(reversed(self.protect)))
 
     def test_train_batch_really_packs_exact_reference_codes(self):
         class Tokenizer:
@@ -126,7 +128,7 @@ class SameSpeakerPilotTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "gradient_eligible=false"):
             self.validate(heldout=heldout)
         with self.assertRaises(ValueError):
-            self.validate(protect=self.protect[:4] + self.heldout)
+            self.validate(protect=self.protect[:3] + self.heldout)
         leaked = deepcopy(self.protect)
         leaked[0]["audio_asset_sha256"] = self.heldout[0]["audio_asset_sha256"]
         with self.assertRaisesRegex(ValueError, "heldout/protector leakage"):
@@ -144,6 +146,20 @@ class SameSpeakerPilotTest(unittest.TestCase):
             self.validate(train=broken_train, heldout=broken_heldout, protect=broken_protect)
 
     def test_machine_artifact_and_ledger_hashes_fail_closed(self):
+        original = self.gate.read_text()
+        report = json.loads(original)
+        report["natural_pcgrad_only"].append({"id": "junhao_real_a03"})
+        self.gate.write_text(json.dumps(report), encoding="utf-8")
+        self.gate_sha = hashlib.sha256(self.gate.read_bytes()).hexdigest()
+        with self.assertRaisesRegex(ValueError, "a03 is reference-only"):
+            self.validate()
+        report["natural_pcgrad_only"][-1] = report["natural_pcgrad_only"][0]
+        self.gate.write_text(json.dumps(report), encoding="utf-8")
+        self.gate_sha = hashlib.sha256(self.gate.read_bytes()).hexdigest()
+        with self.assertRaisesRegex(ValueError, "a03 is reference-only"):
+            self.validate()
+        self.gate.write_text(original, encoding="utf-8")
+        self.gate_sha = hashlib.sha256(self.gate.read_bytes()).hexdigest()
         with self.assertRaisesRegex(ValueError, "SHA-256 mismatch"):
             self.validate(preflight_manifest_sha256="0" * 64)
         report = json.loads(self.gate.read_text()); report["assets"][0]["human_gate_ledger_sha256"] = "0" * 64

@@ -25,7 +25,7 @@ TRAIN_ID = "junhao_caoh"
 HELDOUT_ID = "junhao_hydrate"
 TRAIN_TEXT = "西 诶 左括号 欧 诶吃 右括号 二，氢氧化钙"
 HELDOUT_TEXT = "C O C L 二 点 六 H 二 欧，是六水合氯化钴。"
-PREFLIGHT_SHA256 = "dc8207757d9662a14ce64dfe533b0d0e434512133493d9541219004a598874fb"
+PREFLIGHT_SHA256 = "5e11c6e0165acaabdbcdd11bf5925b99baa7ef11b6110c072ec510b01e24c25c"
 SOURCE_MANIFEST_SHA256 = "348d595cc33f845318ad7c4b3e180c76bd1fb720139f8006186fabb7369a52d5"
 SOURCE_GATE_SHAS = {
     TRAIN_ID: "0d55e9438a549b54aed9ae3a6abb9e38627443802bede5b7a99525ff2400507e",
@@ -34,6 +34,7 @@ SOURCE_GATE_SHAS = {
 HUMAN_LEDGER_SHA256 = "1365fd92327ebc38748e3218688ff2b13cc32572d3a4283ad12ca349461b2aab"
 BASE_MODEL_SHA256 = "24003f2f11ac8a2cbf70514db2d8f1c02fb451aa6b3c0bffc9da09f31cd7caa5"
 REFERENCE_ID = "junhao_real_a03"
+PROTECT_IDS = ("junhao_real_a01", "junhao_real_a02", "junhao_real_a04", "junhao_real_a05")
 
 
 def canonical_sha(value: Any) -> str:
@@ -67,7 +68,7 @@ def _load_preflight(path: str, expected_sha: str) -> dict[str, Any]:
         report = json.loads(gate_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise ValueError("Preflight manifest must be valid UTF-8 JSON.") from exc
-    if report.get("schema") != "min-same-voice-causal-pilot-preflight-v1":
+    if report.get("schema") != "min-same-voice-causal-pilot-preflight-v2":
         raise ValueError("Unexpected same-speaker preflight schema.")
     return report
 
@@ -102,8 +103,10 @@ def validate_same_speaker_pilot(
         raise ValueError("Pilot requires exactly one professional Junhao train row.")
     if len(heldout_rows) != 1 or heldout_rows[0].get("training_role") != HELDOUT_ROLE:
         raise ValueError("Pilot requires exactly one professional Junhao heldout row.")
-    if len(protect_rows) != 5 or any(row.get("protector_role") != PROTECT_ROLE for row in protect_rows):
-        raise ValueError("Pilot requires exactly five natural Junhao protectors.")
+    if (len(protect_rows) != len(PROTECT_IDS)
+            or {row.get("id") for row in protect_rows} != set(PROTECT_IDS)
+            or any(row.get("protector_role") != PROTECT_ROLE for row in protect_rows)):
+        raise ValueError("Pilot requires exactly natural protectors a01/a02/a04/a05.")
     train, heldout = train_rows[0], heldout_rows[0]
     if train.get("id") != TRAIN_ID or train.get("category") != "professional":
         raise ValueError(f"Pilot train row must be pinned to {TRAIN_ID}.")
@@ -164,7 +167,10 @@ def validate_same_speaker_pilot(
                 or asset.get("reference", {}).get("audio_sha256") != reference_audio_sha
                 or asset.get("reference", {}).get("codec_codes_canonical_json_sha256") != reference_code_sha):
             raise ValueError(f"{row['id']} does not bind the reviewed machine artifacts/ledger.")
-    natural = {item.get("id"): item for item in report.get("natural_pcgrad_only", []) if isinstance(item, dict)}
+    natural_items = report.get("natural_pcgrad_only", [])
+    natural = {item.get("id"): item for item in natural_items if isinstance(item, dict)}
+    if len(natural_items) != len(PROTECT_IDS) or len(natural) != len(PROTECT_IDS) or set(natural) != set(PROTECT_IDS):
+        raise ValueError("Preflight protector IDs must be exactly a01/a02/a04/a05; a03 is reference-only.")
     for row in protect_rows:
         item = natural.get(row["id"])
         if not item or item.get("audio_sha256") != row["audio_asset_sha256"] or item.get("codec_codes_sha256") != row["audio_codes_sha256"]:
@@ -185,7 +191,7 @@ def validate_same_speaker_pilot(
             or any(not math.isfinite(value) or not math.isclose(
                 value, expected_protect, rel_tol=0, abs_tol=1e-12
             ) for value in protect_weights[1:])):
-        raise ValueError("Five natural protectors require acoustic-only PCGrad weights 0,1.")
+        raise ValueError("Four natural protectors require acoustic-only PCGrad weights 0,1.")
     if lora_rank <= 0 or lora_target_modules != GLOBAL_LORA_TARGETS or lora_modules_to_save.strip():
         raise ValueError("Pilot requires fresh global attention+MLP LoRA only.")
     model_root = Path(model_path).expanduser()
