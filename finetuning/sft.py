@@ -25,6 +25,14 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from finetuning.common import format_duration, format_timestamp, load_jsonl_spec
+from finetuning.content_supervision import (
+    ContentHead,
+    alignment_vocab,
+    build_content_targets,
+    compute_content_loss,
+    load_content_alignment,
+    validate_alignment_covers_records,
+)
 from finetuning.dataset import MossTTSNanoSFTDataset, stable_sample_id
 from finetuning.eos_calibration import validate_calibration_records
 from finetuning.joint_formula_sft import validate_joint_formula_pilot
@@ -192,6 +200,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--same-speaker-heldout-jsonl", default="")
     parser.add_argument("--same-speaker-preflight-manifest", default="")
     parser.add_argument("--same-speaker-preflight-manifest-sha256", default="")
+    parser.add_argument(
+        "--content-loss-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight of the auxiliary content-head CE on aligned response frames (route A1). "
+            "The default 0.0 preserves the legacy objective bit-for-bit."
+        ),
+    )
+    parser.add_argument(
+        "--content-alignment-jsonl",
+        default="",
+        help="Per-frame character alignment manifest; required when --content-loss-weight > 0.",
+    )
     return parser.parse_args()
 
 
@@ -212,6 +234,12 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("`warmup_ratio` must be in [0, 1).")
     if args.num_epochs <= 0:
         raise ValueError("`num_epochs` must be > 0.")
+    if args.content_loss_weight < 0:
+        raise ValueError("`content_loss_weight` must be >= 0.")
+    if args.content_loss_weight > 0 and not args.content_alignment_jsonl:
+        raise ValueError("--content-alignment-jsonl is required when --content-loss-weight > 0.")
+    if args.content_alignment_jsonl and args.content_loss_weight <= 0:
+        raise ValueError("--content-alignment-jsonl requires --content-loss-weight > 0.")
     if args.max_train_steps is not None and args.max_train_steps <= 0:
         raise ValueError("`max_train_steps` must be > 0 when set.")
     if args.max_grad_norm < 0:
@@ -520,9 +548,12 @@ def validate_round2_model_baseline(
         )
 
 
-def build_optimizer(model, args: argparse.Namespace) -> AdamW:
+def build_optimizer(model, args: argparse.Namespace, extra_modules=()) -> AdamW:
+    parameters = list(model.parameters())
+    for module in extra_modules:
+        parameters.extend(module.parameters())
     return AdamW(
-        model.parameters(),
+        parameters,
         lr=args.learning_rate,
         weight_decay=args.weight_decay,
         betas=(args.adam_beta1, args.adam_beta2),
@@ -687,6 +718,7 @@ def compute_supervised_loss(
     acoustic_tail_start_frames: Optional[torch.LongTensor] = None,
     acoustic_tail_weighted_mask: Optional[torch.BoolTensor] = None,
     return_breakdown: bool = False,
+    return_global_hidden: bool = False,
 ):
     outputs = model(
         input_ids=input_ids,
@@ -807,7 +839,11 @@ def compute_supervised_loss(
         raise RuntimeError("All labels are ignored; check dataset packing and max_length.")
     resolved_loss = total_loss / total_weight
     if return_breakdown:
+        if return_global_hidden:
+            return resolved_loss, channel_losses, global_hidden_states
         return resolved_loss, channel_losses
+    if return_global_hidden:
+        return resolved_loss, global_hidden_states
     return resolved_loss
 
 
@@ -877,6 +913,7 @@ def save_checkpoint(
     train_args: Dict[str, Any],
     global_step: int,
     epoch: int,
+    content_head=None,
 ) -> None:
     accelerator.wait_for_everyone()
     if not accelerator.is_main_process:
@@ -893,6 +930,14 @@ def save_checkpoint(
         metadata["saved_at"] = format_timestamp()
         metadata["checkpoint_dir"] = str(output_dir)
         metadata["checkpoint_type"] = "lora_adapter"
+        if content_head is not None:
+            head_path = output_dir / "content_head.pt"
+            torch.save(
+                {key: value.detach().cpu() for key, value in content_head.state_dict().items()},
+                head_path,
+            )
+            metadata["content_head_file"] = head_path.name
+            metadata["content_head_sha256"] = hashlib.sha256(head_path.read_bytes()).hexdigest()
         with open(output_dir / "finetune_config.json", "w", encoding="utf-8") as handle:
             json.dump(metadata, handle, indent=2, ensure_ascii=False)
         return
@@ -916,6 +961,14 @@ def save_checkpoint(
     metadata["saved_epoch"] = int(epoch)
     metadata["saved_at"] = format_timestamp()
     metadata["checkpoint_dir"] = str(output_dir)
+    if content_head is not None:
+        head_path = output_dir / "content_head.pt"
+        torch.save(
+            {key: value.detach().cpu() for key, value in content_head.state_dict().items()},
+            head_path,
+        )
+        metadata["content_head_file"] = head_path.name
+        metadata["content_head_sha256"] = hashlib.sha256(head_path.read_bytes()).hexdigest()
     with open(output_dir / "finetune_config.json", "w", encoding="utf-8") as handle:
         json.dump(metadata, handle, indent=2, ensure_ascii=False)
 
@@ -1005,6 +1058,16 @@ def main() -> None:
             ),
         )
 
+    content_alignment = None
+    content_head = None
+    if args.content_loss_weight > 0:
+        content_alignment = load_content_alignment(args.content_alignment_jsonl)
+        validate_alignment_covers_records(content_alignment, records)
+        content_head = ContentHead(
+            hidden_size=int(model.config.hidden_size),
+            vocab=alignment_vocab(content_alignment),
+        )
+
     dataset = MossTTSNanoSFTDataset(
         records,
         tokenizer=tokenizer,
@@ -1046,7 +1109,7 @@ def main() -> None:
             collate_fn=behavior_dataset.collate_fn,
         )
 
-    optimizer = build_optimizer(model, args)
+    optimizer = build_optimizer(model, args, extra_modules=[content_head] if content_head is not None else [])
     global_batch_size = (
         args.per_device_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
     )
@@ -1113,16 +1176,16 @@ def main() -> None:
         num_training_steps=max_train_steps,
     )
     if protect_dataloader is None:
-        model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-            model, optimizer, train_dataloader, lr_scheduler,
+        model, content_head, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            model, content_head, optimizer, train_dataloader, lr_scheduler,
         )
     elif behavior_protect_dataloader is None:
-        model, optimizer, train_dataloader, protect_dataloader, lr_scheduler = accelerator.prepare(
-            model, optimizer, train_dataloader, protect_dataloader, lr_scheduler,
+        model, content_head, optimizer, train_dataloader, protect_dataloader, lr_scheduler = accelerator.prepare(
+            model, content_head, optimizer, train_dataloader, protect_dataloader, lr_scheduler,
         )
     else:
-        model, optimizer, train_dataloader, protect_dataloader, behavior_protect_dataloader, lr_scheduler = accelerator.prepare(
-            model, optimizer, train_dataloader, protect_dataloader, behavior_protect_dataloader, lr_scheduler,
+        model, content_head, optimizer, train_dataloader, protect_dataloader, behavior_protect_dataloader, lr_scheduler = accelerator.prepare(
+            model, content_head, optimizer, train_dataloader, protect_dataloader, behavior_protect_dataloader, lr_scheduler,
         )
 
     output_root = Path(args.output_dir)
@@ -1142,6 +1205,16 @@ def main() -> None:
     train_args_to_save["behavior_protect_records_paths"] = [str(path.resolve()) for path in behavior_records_paths]
     train_args_to_save["same_speaker_heldout_records_paths"] = [str(path.resolve()) for path in same_speaker_heldout_paths]
     train_args_to_save["resolved_same_speaker_contract"] = resolved_same_speaker_contract
+    if content_alignment is not None:
+        train_args_to_save["resolved_content_alignment"] = {
+            sample_id: {
+                "frames": entry["frames"],
+                "vocab_sha256": hashlib.sha256(
+                    json.dumps(list(entry["vocab"]), ensure_ascii=False).encode("utf-8")
+                ).hexdigest(),
+            }
+            for sample_id, entry in sorted(content_alignment.items())
+        }
     train_args_to_save["attn_implementation"] = attn_implementation
     trainable_parameters = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
     total_parameters = sum(parameter.numel() for parameter in model.parameters())
@@ -1171,22 +1244,55 @@ def main() -> None:
         model.train()
         for batch in train_dataloader:
             with accelerator.accumulate(model):
-                loss, channel_losses = compute_supervised_loss(
-                    model,
-                    input_ids=batch["input_ids"],
-                    attention_mask=batch["attention_mask"],
-                    labels=batch["labels"],
-                    channelwise_loss_weight=channelwise_loss_weight,
-                    eos_loss_weight=args.eos_loss_weight,
-                    eos_loss_mode=args.eos_loss_mode,
-                    acoustic_frame_indices=(batch.get("acoustic_frame_indices")
-                                            if args.joint_formula_tail_weighting else None),
-                    acoustic_tail_start_frames=(batch.get("acoustic_tail_start_frames")
+                content_enabled = content_head is not None
+                if content_enabled:
+                    loss, channel_losses, global_hidden = compute_supervised_loss(
+                        model,
+                        input_ids=batch["input_ids"],
+                        attention_mask=batch["attention_mask"],
+                        labels=batch["labels"],
+                        channelwise_loss_weight=channelwise_loss_weight,
+                        eos_loss_weight=args.eos_loss_weight,
+                        eos_loss_mode=args.eos_loss_mode,
+                        acoustic_frame_indices=(batch.get("acoustic_frame_indices")
                                                 if args.joint_formula_tail_weighting else None),
-                    acoustic_tail_weighted_mask=(batch.get("acoustic_tail_weighted_mask")
+                        acoustic_tail_start_frames=(batch.get("acoustic_tail_start_frames")
+                                                    if args.joint_formula_tail_weighting else None),
+                        acoustic_tail_weighted_mask=(batch.get("acoustic_tail_weighted_mask")
+                                                     if args.joint_formula_tail_weighting else None),
+                        return_breakdown=True,
+                        return_global_hidden=True,
+                    )
+                else:
+                    loss, channel_losses = compute_supervised_loss(
+                        model,
+                        input_ids=batch["input_ids"],
+                        attention_mask=batch["attention_mask"],
+                        labels=batch["labels"],
+                        channelwise_loss_weight=channelwise_loss_weight,
+                        eos_loss_weight=args.eos_loss_weight,
+                        eos_loss_mode=args.eos_loss_mode,
+                        acoustic_frame_indices=(batch.get("acoustic_frame_indices")
                                                 if args.joint_formula_tail_weighting else None),
-                    return_breakdown=True,
-                )
+                        acoustic_tail_start_frames=(batch.get("acoustic_tail_start_frames")
+                                                    if args.joint_formula_tail_weighting else None),
+                        acoustic_tail_weighted_mask=(batch.get("acoustic_tail_weighted_mask")
+                                                     if args.joint_formula_tail_weighting else None),
+                        return_breakdown=True,
+                    )
+                    global_hidden = None
+                content_metrics = None
+                if content_enabled:
+                    content_targets = build_content_targets(
+                        batch["sample_ids"],
+                        batch["acoustic_frame_indices"],
+                        content_alignment,
+                        device=global_hidden.device,
+                    )
+                    content_loss, content_metrics = compute_content_loss(
+                        content_head, global_hidden, content_targets,
+                    )
+                    loss = loss + args.content_loss_weight * content_loss
                 projection_report = None
                 if protect_dataloader is None:
                     accelerator.backward(loss)
@@ -1221,7 +1327,10 @@ def main() -> None:
                     gradient_norms = module_gradient_norms(model, loss_scale=loss_scale)
 
                 if accelerator.sync_gradients and args.max_grad_norm > 0:
-                    accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                    clip_parameters = list(model.parameters())
+                    if content_head is not None:
+                        clip_parameters.extend(content_head.parameters())
+                    accelerator.clip_grad_norm_(clip_parameters, args.max_grad_norm)
 
                 if accelerator.sync_gradients:
                     optimizer.step()
@@ -1266,6 +1375,7 @@ def main() -> None:
                                 "loss": logged_loss,
                                 "learning_rate": lr_val,
                                 "channel_loss": gathered_channels,
+                                "content": content_metrics,
                                 "gradient_norm_pre_clip": gradient_norms or {},
                                 "teacher_sample_ids": list(batch.get("sample_ids", [])) if args.pcgrad else None,
                                 "protector_sample_ids": [sid for item in acoustic_batches for sid in item.get("sample_ids", [])] if args.pcgrad else None,
@@ -1307,6 +1417,7 @@ def main() -> None:
                 train_args=train_args_to_save,
                 global_step=global_step,
                 epoch=epoch + 1,
+                content_head=content_head,
             )
         completed_epochs = epoch + 1
 
@@ -1323,6 +1434,7 @@ def main() -> None:
         train_args=train_args_to_save,
         global_step=global_step,
         epoch=completed_epochs,
+        content_head=content_head,
     )
     accelerator.print(
         f"[{format_timestamp()}] [sft] finished "
