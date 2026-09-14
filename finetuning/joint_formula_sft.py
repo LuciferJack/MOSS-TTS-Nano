@@ -51,6 +51,13 @@ def validate_joint_formula_rows(rows: list[dict[str, Any]]) -> list[dict[str, An
             isinstance(frame, list) and len(frame) == PILOT_N_VQ for frame in codes
         ):
             raise ValueError(f"Joint row {sample_id} requires MOSS codec audio_codes.")
+        boundary = row.get("acoustic_tail_start_frame")
+        if boundary is not None and (
+            isinstance(boundary, bool) or not isinstance(boundary, int) or not 0 < boundary < len(codes)
+        ):
+            raise ValueError(
+                f"Joint row {sample_id} acoustic_tail_start_frame must satisfy 0 < boundary < {len(codes)}."
+            )
         if row.get("audio_codes_sha256") != _canonical_sha(codes):
             raise ValueError(f"Joint row {sample_id} audio code hash mismatch.")
         provenance = row.get("teacher_provenance")
@@ -72,6 +79,10 @@ def validate_joint_formula_pilot(
     model_path: str = "", lora_target_modules: str = GLOBAL_LORA_TARGETS,
     lora_modules_to_save: str = "", prior_report_path: str = "",
     prior_report_sha256: str = "",
+    tail_weighting: bool = False, v2_fail_report_path: str = "",
+    v2_fail_report_sha256: str = "", trace_audit_path: str = "",
+    trace_audit_sha256: str = "",
+    alignment_report_path: str = "", alignment_report_sha256: str = "",
 ) -> None:
     selected = validate_joint_formula_rows(rows)
     if not selected:
@@ -127,6 +138,62 @@ def validate_joint_formula_pilot(
             raise ValueError("0.5 pilot requires a genuine 0.125 content_fail verdict.")
     elif prior_report_path or prior_report_sha256:
         raise ValueError("0.125 baseline pilot must not claim a prior failure artifact.")
+    tail_boundaries = [row.get("acoustic_tail_start_frame") for row in selected]
+    tail_artifacts = (v2_fail_report_path, v2_fail_report_sha256, trace_audit_path, trace_audit_sha256,
+                      alignment_report_path, alignment_report_sha256)
+    if tail_weighting:
+        if allowed_total != 0.5 or any(boundary is None for boundary in tail_boundaries):
+            raise ValueError("v3 tail weighting requires audio total 0.5 and one valid boundary per row.")
+        v2_path = Path(v2_fail_report_path).expanduser()
+        audit_path = Path(trace_audit_path).expanduser()
+        alignment_path = Path(alignment_report_path).expanduser()
+        for name, path, supplied_sha in (
+            ("v2 FAIL report", v2_path, v2_fail_report_sha256),
+            ("v1/v2 trace audit", audit_path, trace_audit_sha256),
+            ("teacher alignment report", alignment_path, alignment_report_sha256),
+        ):
+            if not path.is_file() or not re.fullmatch(r"[0-9a-f]{64}", supplied_sha):
+                raise ValueError(f"v3 tail weighting requires a hashed {name}.")
+            if hashlib.sha256(path.read_bytes()).hexdigest() != supplied_sha:
+                raise ValueError(f"{name} SHA-256 mismatch.")
+        try:
+            v2_report = json.loads(v2_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError("v2 FAIL report must be valid UTF-8 JSON.") from exc
+        v2_hashes = (v2_report.get("candidate_weights_sha256", ""),
+                     v2_report.get("content_eval_manifest_sha256", ""))
+        if (v2_report.get("acoustic_total_weight") != 0.5
+                or v2_report.get("verdict") != "content_fail"
+                or not all(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value)
+                           for value in v2_hashes)):
+            raise ValueError("v3 requires a genuine 0.5 content_fail verdict.")
+        try:
+            alignment = json.loads(alignment_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError("Teacher alignment report must be valid UTF-8 JSON.") from exc
+        if alignment.get("schema") != "joint-teacher-tail-alignment-audit-v1":
+            raise ValueError("Unexpected teacher alignment report schema.")
+        alignment_rows = {row.get("id"): row for row in alignment.get("rows", [])}
+        for row in selected:
+            evidence = row.get("acoustic_tail_alignment")
+            report_row = alignment_rows.get(row["id"])
+            if not isinstance(evidence, dict) or not isinstance(report_row, dict):
+                raise ValueError(f"Joint row {row['id']} requires alignment evidence.")
+            interval = report_row.get("boundary_interval_frames")
+            if (not isinstance(interval, list) or len(interval) != 2
+                    or any(isinstance(value, bool) or not isinstance(value, int) for value in interval)
+                    or interval[0] > interval[1] or interval[1] - interval[0] > 1):
+                raise ValueError(f"Joint row {row['id']} alignment uncertainty exceeds one frame.")
+            if (evidence.get("report_sha256") != alignment_report_sha256
+                    or evidence.get("policy") != "conservative_lower_bound"
+                    or evidence.get("boundary_interval_frames") != interval
+                    or evidence.get("selected_frame") != interval[0]
+                    or evidence.get("uncertainty_frames") != interval[1] - interval[0]
+                    or row["acoustic_tail_start_frame"] != interval[0]
+                    or report_row.get("audio_frames") != len(row["audio_codes"])):
+                raise ValueError(f"Joint row {row['id']} alignment evidence does not bind the report.")
+    elif any(boundary is not None for boundary in tail_boundaries) or any(tail_artifacts):
+        raise ValueError("Tail boundaries/artifacts require explicit v3 tail weighting.")
     if acoustic_weights[0] != 0 or not math.isclose(sum(acoustic_weights[1:]), 1.0):
         raise ValueError("Acoustic protect objective must be 0,1.")
     expected_ids = [row["id"] for row in rows]

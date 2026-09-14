@@ -177,6 +177,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--joint-formula-prior-report", default="")
     parser.add_argument("--joint-formula-prior-report-sha256", default="")
+    parser.add_argument(
+        "--joint-formula-tail-weighting", action="store_true",
+        help="Enable the v3 body:tail acoustic frame weighting of 1:2 without changing total audio weight.",
+    )
+    parser.add_argument("--joint-formula-v2-fail-report", default="")
+    parser.add_argument("--joint-formula-v2-fail-report-sha256", default="")
+    parser.add_argument("--joint-formula-trace-audit", default="")
+    parser.add_argument("--joint-formula-trace-audit-sha256", default="")
+    parser.add_argument("--joint-formula-alignment-report", default="")
+    parser.add_argument("--joint-formula-alignment-report-sha256", default="")
     return parser.parse_args()
 
 
@@ -610,6 +620,33 @@ def compute_text_loss(
     return loss, breakdown
 
 
+def compute_tail_weighted_channel_loss(
+    channel_logits: torch.Tensor,
+    channel_targets: torch.LongTensor,
+    *,
+    batch_size: int,
+    seq_len: int,
+    acoustic_frame_indices: torch.LongTensor,
+    acoustic_tail_start_frames: torch.LongTensor,
+) -> torch.Tensor:
+    """Return a sample-balanced body:tail 1:2 CE for one VQ head."""
+    if tuple(acoustic_frame_indices.shape) != (batch_size, seq_len):
+        raise ValueError("Acoustic frame indices must match the shifted label shape.")
+    if tuple(acoustic_tail_start_frames.shape) != (batch_size,):
+        raise ValueError("One acoustic tail boundary is required per sample.")
+    per_token = F.cross_entropy(
+        channel_logits.float(), channel_targets, ignore_index=-100, reduction="none"
+    ).reshape(batch_size, seq_len)
+    valid = channel_targets.reshape(batch_size, seq_len).ne(-100)
+    frame_indices = acoustic_frame_indices.to(device=per_token.device)
+    boundaries = acoustic_tail_start_frames.to(device=per_token.device)
+    weights = torch.where(frame_indices >= boundaries[:, None], 2.0, 1.0) * valid
+    denominators = weights.sum(dim=1)
+    if (denominators <= 0).any():
+        raise ValueError("Every tail-weighted sample must contain acoustic targets.")
+    return ((per_token * weights).sum(dim=1) / denominators).mean()
+
+
 def compute_supervised_loss(
     model,
     *,
@@ -619,6 +656,8 @@ def compute_supervised_loss(
     channelwise_loss_weight: List[float],
     eos_loss_weight: float = 1.0,
     eos_loss_mode: str = "token_weight",
+    acoustic_frame_indices: Optional[torch.LongTensor] = None,
+    acoustic_tail_start_frames: Optional[torch.LongTensor] = None,
     return_breakdown: bool = False,
 ):
     outputs = model(
@@ -720,7 +759,17 @@ def compute_supervised_loss(
         if not (channel_targets != -100).any():
             continue
         channel_logits = base_model.audio_lm_heads[channel_index](local_hidden_states[:, channel_index + 1, :])
-        channel_loss = F.cross_entropy(channel_logits.float(), channel_targets, ignore_index=-100)
+        if acoustic_tail_start_frames is None:
+            # Preserve the legacy objective bit-for-bit when tail weighting is absent.
+            channel_loss = F.cross_entropy(channel_logits.float(), channel_targets, ignore_index=-100)
+        else:
+            if acoustic_frame_indices is None:
+                raise ValueError("Tail weighting requires acoustic frame indices.")
+            channel_loss = compute_tail_weighted_channel_loss(
+                channel_logits, channel_targets, batch_size=batch_size, seq_len=seq_len,
+                acoustic_frame_indices=acoustic_frame_indices,
+                acoustic_tail_start_frames=acoustic_tail_start_frames,
+            )
         channel_losses[f"vq{channel_index}"] = channel_loss.detach().float()
         total_loss = total_loss + float(channelwise_loss_weight[channel_index + 1]) * channel_loss.float()
         total_weight += float(channelwise_loss_weight[channel_index + 1])
@@ -869,6 +918,11 @@ def main() -> None:
     attn_implementation = resolve_attn_implementation(args.attn_implementation, model_dtype)
     records_paths, records = load_jsonl_spec(args.train_jsonl)
     records, train_schedule = apply_train_schedule(records, args.train_schedule_json)
+    has_tail_boundaries = any(record.get("acoustic_tail_start_frame") is not None for record in records)
+    if has_tail_boundaries and not args.joint_formula_tail_weighting:
+        raise ValueError("acoustic_tail_start_frame requires explicit --joint-formula-tail-weighting.")
+    if args.joint_formula_tail_weighting and not args.joint_formula_pilot:
+        raise ValueError("--joint-formula-tail-weighting requires --joint-formula-pilot.")
     validate_calibration_protection_enabled(records, pcgrad=args.pcgrad)
     protect_records_paths, protect_records = (load_jsonl_spec(args.protect_jsonl) if args.pcgrad else ([], []))
     behavior_records_paths, behavior_records = (
@@ -985,6 +1039,13 @@ def main() -> None:
         lora_modules_to_save=args.lora_modules_to_save,
         prior_report_path=args.joint_formula_prior_report,
         prior_report_sha256=args.joint_formula_prior_report_sha256,
+        tail_weighting=args.joint_formula_tail_weighting,
+        v2_fail_report_path=args.joint_formula_v2_fail_report,
+        v2_fail_report_sha256=args.joint_formula_v2_fail_report_sha256,
+        trace_audit_path=args.joint_formula_trace_audit,
+        trace_audit_sha256=args.joint_formula_trace_audit_sha256,
+        alignment_report_path=args.joint_formula_alignment_report,
+        alignment_report_sha256=args.joint_formula_alignment_report_sha256,
     )
     if args.pcgrad:
         validate_behavior_protection(
@@ -1068,6 +1129,10 @@ def main() -> None:
                     channelwise_loss_weight=channelwise_loss_weight,
                     eos_loss_weight=args.eos_loss_weight,
                     eos_loss_mode=args.eos_loss_mode,
+                    acoustic_frame_indices=(batch.get("acoustic_frame_indices")
+                                            if args.joint_formula_tail_weighting else None),
+                    acoustic_tail_start_frames=(batch.get("acoustic_tail_start_frames")
+                                                if args.joint_formula_tail_weighting else None),
                     return_breakdown=True,
                 )
                 projection_report = None

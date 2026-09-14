@@ -154,6 +154,7 @@ class MossTTSNanoSFTDataset(Dataset):
             "reference_frames": torch.tensor(reference_frames, dtype=torch.long),
             "response_audio_frames": torch.tensor(int(target_codes.shape[0]), dtype=torch.long),
             "text_only_eos_calibration": calibration,
+            "acoustic_tail_start_frame": record.get("acoustic_tail_start_frame"),
         }
 
     def collate_fn(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -168,6 +169,7 @@ class MossTTSNanoSFTDataset(Dataset):
         full_input_ids[:, :, 0] = int(self.model_config.pad_token_id)
         full_attention_mask = torch.zeros((batch_size, self.max_length), dtype=torch.bool)
         loss_mask = torch.zeros((batch_size, self.max_length - 1), dtype=torch.bool)
+        acoustic_frame_indices = torch.full((batch_size, self.max_length - 1), -1, dtype=torch.long)
 
         for batch_index, item in enumerate(batch):
             sequence = item["full_input_ids"]
@@ -177,6 +179,10 @@ class MossTTSNanoSFTDataset(Dataset):
             full_input_ids[batch_index, :seq_len, :] = sequence
             full_attention_mask[batch_index, :seq_len] = True
             loss_mask[batch_index, prompt_length - 1 : seq_len - 1] = True
+            response_frames = int(item["response_audio_frames"].item())
+            acoustic_frame_indices[batch_index, prompt_length - 1 : prompt_length - 1 + response_frames] = torch.arange(
+                response_frames, dtype=torch.long
+            )
 
         labels = full_input_ids[:, 1:, :].clone()
         labels = labels.masked_fill(~loss_mask.unsqueeze(-1), -100)
@@ -191,12 +197,20 @@ class MossTTSNanoSFTDataset(Dataset):
                 # expose them to any acoustic/VQ objective, even accidentally.
                 labels[batch_index, :, 1:] = -100
 
-        return {
+        result = {
             "sample_ids": [str(item["sample_id"]) for item in batch],
             "input_ids": full_input_ids[:, :-1, :].contiguous(),
             "attention_mask": full_attention_mask[:, :-1].contiguous(),
             "labels": labels.contiguous(),
+            "acoustic_frame_indices": acoustic_frame_indices,
         }
+        if any(item.get("acoustic_tail_start_frame") is not None for item in batch):
+            if any(item.get("acoustic_tail_start_frame") is None for item in batch):
+                raise ValueError("Tail-weighted batches cannot mix configured and unconfigured samples.")
+            result["acoustic_tail_start_frames"] = torch.tensor(
+                [int(item["acoustic_tail_start_frame"]) for item in batch], dtype=torch.long
+            )
+        return result
 
     def _resolve_reference_codes(
         self,
