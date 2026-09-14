@@ -38,6 +38,7 @@ The legacy `pass_user` string is never trusted as a gate. Training remains
 blocked until a new bundle embeds the exact reference codes and passes this
 validator.
 
-`same_speaker_pilot.validate_same_speaker_pilot` is the fail-closed bundle gate.
-It is deliberately not wired into `sft.py` until real assets pass preflight, so
-no partially valid command can launch training.
+`same_speaker_pilot.validate_same_speaker_pilot` is wired into `sft.py` behind
+the explicit `--same-speaker-pilot` flag. The trainer separately loads the B
+heldout manifest only for validation; it never constructs a dataset or gradient
+path from it. A partially valid command fails before any optimizer step.

@@ -3,9 +3,13 @@ import hashlib
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
+import torch
 
+from finetuning.dataset import MossTTSNanoSFTDataset
+from finetuning.sft import validate_args
 from finetuning.same_speaker_pilot import GLOBAL_LORA_TARGETS, HUMAN_LEDGER_SHA256, SOURCE_GATE_SHAS, SOURCE_MANIFEST_SHA256, canonical_sha, validate_same_speaker_pilot
 from finetuning.same_speaker_pilot import HELDOUT_TEXT, TRAIN_TEXT
 
@@ -18,7 +22,7 @@ def row(identifier, role, category, asset, structure, reference_codes, reference
         "audio_codes": codes, "audio_codes_sha256": canonical_sha(codes),
         "audio_asset_sha256": asset, "ref_audio_codes": reference_codes,
         "reference_codes_sha256": canonical_sha(reference_codes),
-        "reference_provenance": {"speaker": "Junhao", "audio_asset_sha256": reference_asset},
+        "reference_provenance": {"id": "junhao_real_a03", "speaker": "Junhao", "audio_asset_sha256": reference_asset},
         "gradient_eligible": role != "same_speaker_professional_heldout",
     }
     if "protector" in role:
@@ -78,8 +82,44 @@ class SameSpeakerPilotTest(unittest.TestCase):
                                                protect or self.protect, **opts)
 
     def test_exact_contract_and_early_stop_candidates(self):
-        self.assertEqual(self.validate()["candidate_steps"], [1, 2, 4])
+        contract = self.validate()
+        self.assertEqual(contract["candidate_steps"], [1, 2, 4])
+        self.assertEqual(contract["train_id"], "junhao_caoh")
+        self.assertEqual(contract["heldout_id"], "junhao_hydrate")
+        self.assertNotIn(contract["heldout_id"], contract["protector_ids"])
+        self.assertEqual(contract["reference_id"], "junhao_real_a03")
         self.assertEqual(self.validate(max_train_steps=2)["candidate_steps"], [1, 2])
+
+    def test_train_batch_really_packs_exact_reference_codes(self):
+        class Tokenizer:
+            def encode(self, text, add_special_tokens=False):
+                return [ord(char) for char in text]
+        config = SimpleNamespace(
+            n_vq=16, im_start_token_id=1101, im_end_token_id=1102,
+            audio_start_token_id=1103, audio_end_token_id=1104,
+            audio_user_slot_token_id=1105, audio_assistant_slot_token_id=1106,
+            audio_pad_token_id=0, pad_token_id=0,
+        )
+        dataset = MossTTSNanoSFTDataset(self.train, tokenizer=Tokenizer(), model_config=config, max_length=512)
+        item = dataset[0]
+        self.assertEqual(int(item["reference_frames"]), len(self.ref_codes))
+        rows = item["full_input_ids"]
+        reference_rows = rows[rows[:, 0] == config.audio_user_slot_token_id]
+        self.assertTrue(torch.equal(reference_rows[:, 1:], torch.tensor(self.ref_codes)))
+
+    def test_runtime_requires_individual_protectors_and_candidate_checkpoints(self):
+        base = dict(max_length=256, per_device_batch_size=1, gradient_accumulation_steps=1,
+                    learning_rate=1e-5, weight_decay=0, warmup_steps=0, warmup_ratio=0,
+                    num_epochs=4, max_train_steps=4, max_grad_norm=1, logging_steps=1,
+                    save_every_epochs=1, num_workers=0, lora_rank=4, lora_alpha=8,
+                    eos_loss_weight=1, lora_dropout=0, pcgrad=True, protect_jsonl="protect",
+                    behavior_protect_jsonl="", train_schedule_json="", same_speaker_pilot=True,
+                    same_speaker_heldout_jsonl="heldout", same_speaker_preflight_manifest="manifest",
+                    same_speaker_preflight_manifest_sha256="a" * 64, joint_formula_pilot=False)
+        validate_args(SimpleNamespace(**base))
+        for changes in ({"per_device_batch_size": 2}, {"save_every_epochs": 2}, {"num_epochs": 3}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                validate_args(SimpleNamespace(**{**base, **changes}))
 
     def test_heldout_never_gradient_or_protection(self):
         heldout = deepcopy(self.heldout); heldout[0]["gradient_eligible"] = True

@@ -28,6 +28,7 @@ from finetuning.common import format_duration, format_timestamp, load_jsonl_spec
 from finetuning.dataset import MossTTSNanoSFTDataset, stable_sample_id
 from finetuning.eos_calibration import validate_calibration_records
 from finetuning.joint_formula_sft import validate_joint_formula_pilot
+from finetuning.same_speaker_pilot import validate_same_speaker_pilot
 from finetuning.protected_gradient import is_feasible_dot, project_teacher_gradient
 
 DEFAULT_MODEL_PATH = REPO_ROOT / "models" / "MOSS-TTS-Nano"
@@ -187,6 +188,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--joint-formula-trace-audit-sha256", default="")
     parser.add_argument("--joint-formula-alignment-report", default="")
     parser.add_argument("--joint-formula-alignment-report-sha256", default="")
+    parser.add_argument("--same-speaker-pilot", action="store_true")
+    parser.add_argument("--same-speaker-heldout-jsonl", default="")
+    parser.add_argument("--same-speaker-preflight-manifest", default="")
+    parser.add_argument("--same-speaker-preflight-manifest-sha256", default="")
     return parser.parse_args()
 
 
@@ -235,6 +240,21 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("Scheduled training requires `--per-device-batch-size 1` for step-level auditability.")
     if args.train_schedule_json and args.gradient_accumulation_steps != 1:
         raise ValueError("Scheduled training requires `--gradient-accumulation-steps 1`.")
+    same_speaker_fields = (args.same_speaker_heldout_jsonl, args.same_speaker_preflight_manifest,
+                           args.same_speaker_preflight_manifest_sha256)
+    if (args.same_speaker_pilot and not all(bool(value) for value in same_speaker_fields)) or (
+        not args.same_speaker_pilot and any(bool(value) for value in same_speaker_fields)
+    ):
+        raise ValueError("Same-speaker pilot requires its heldout JSONL and preflight path/SHA together.")
+    if args.same_speaker_pilot and args.joint_formula_pilot:
+        raise ValueError("Same-speaker and joint-formula pilots are mutually exclusive.")
+    if args.same_speaker_pilot:
+        if args.per_device_batch_size != 1:
+            raise ValueError("Same-speaker pilot requires batch size 1 for per-protector PCGrad.")
+        if args.save_every_epochs != 1:
+            raise ValueError("Same-speaker pilot requires one checkpoint per epoch for step 1/2/4 gates.")
+        if args.max_train_steps is None or args.num_epochs < args.max_train_steps:
+            raise ValueError("Same-speaker singleton pilot requires num_epochs >= max_train_steps.")
 
 
 def pcgrad_backward(
@@ -938,6 +958,9 @@ def main() -> None:
     behavior_records_paths, behavior_records = (
         load_jsonl_spec(args.behavior_protect_jsonl) if args.behavior_protect_jsonl else ([], [])
     )
+    same_speaker_heldout_paths, same_speaker_heldout_records = (
+        load_jsonl_spec(args.same_speaker_heldout_jsonl) if args.same_speaker_pilot else ([], [])
+    )
     if train_schedule and args.max_train_steps != len(train_schedule):
         raise ValueError(
             "Scheduled training requires max_train_steps to equal the schedule length "
@@ -1057,6 +1080,18 @@ def main() -> None:
         alignment_report_path=args.joint_formula_alignment_report,
         alignment_report_sha256=args.joint_formula_alignment_report_sha256,
     )
+    resolved_same_speaker_contract = None
+    if args.same_speaker_pilot:
+        resolved_same_speaker_contract = validate_same_speaker_pilot(
+            records, same_speaker_heldout_records, protect_records,
+            preflight_manifest_path=args.same_speaker_preflight_manifest,
+            preflight_manifest_sha256=args.same_speaker_preflight_manifest_sha256,
+            max_train_steps=args.max_train_steps, eos_loss_mode=args.eos_loss_mode,
+            channel_weights=channelwise_loss_weight, protect_weights=protect_channelwise_loss_weight,
+            pcgrad=args.pcgrad, lora_rank=args.lora_rank, model_path=args.model_path,
+            lora_target_modules=args.lora_target_modules, lora_modules_to_save=args.lora_modules_to_save,
+            tail_weighting=args.joint_formula_tail_weighting,
+        )
     if args.pcgrad:
         validate_behavior_protection(
             records, protect_records, behavior_records,
@@ -1102,6 +1137,8 @@ def main() -> None:
     train_args_to_save["resolved_train_schedule"] = train_schedule
     train_args_to_save["protect_records_paths"] = [str(path.resolve()) for path in protect_records_paths]
     train_args_to_save["behavior_protect_records_paths"] = [str(path.resolve()) for path in behavior_records_paths]
+    train_args_to_save["same_speaker_heldout_records_paths"] = [str(path.resolve()) for path in same_speaker_heldout_paths]
+    train_args_to_save["resolved_same_speaker_contract"] = resolved_same_speaker_contract
     train_args_to_save["attn_implementation"] = attn_implementation
     trainable_parameters = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
     total_parameters = sum(parameter.numel() for parameter in model.parameters())

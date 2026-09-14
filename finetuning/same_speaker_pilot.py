@@ -33,6 +33,7 @@ SOURCE_GATE_SHAS = {
 }
 HUMAN_LEDGER_SHA256 = "1365fd92327ebc38748e3218688ff2b13cc32572d3a4283ad12ca349461b2aab"
 BASE_MODEL_SHA256 = "24003f2f11ac8a2cbf70514db2d8f1c02fb451aa6b3c0bffc9da09f31cd7caa5"
+REFERENCE_ID = "junhao_real_a03"
 
 
 def canonical_sha(value: Any) -> str:
@@ -82,7 +83,8 @@ def _validate_reference(row: dict[str, Any]) -> tuple[str, str]:
     if row.get("reference_codes_sha256") != code_sha:
         raise ValueError(f"{sample_id} reference code SHA-256 mismatch.")
     provenance = row.get("reference_provenance")
-    if not isinstance(provenance, dict) or provenance.get("speaker") != "Junhao":
+    if (not isinstance(provenance, dict) or provenance.get("speaker") != "Junhao"
+            or provenance.get("id") != REFERENCE_ID):
         raise ValueError(f"{sample_id} reference must have Junhao provenance.")
     return code_sha, _sha(provenance.get("audio_asset_sha256"), "reference audio_asset_sha256")
 
@@ -201,6 +203,7 @@ def validate_same_speaker_pilot(
         "protector_ids": [row["id"] for row in protect_rows],
         "reference_codes_sha256": reference_code_sha,
         "reference_audio_sha256": reference_audio_sha,
+        "reference_id": REFERENCE_ID,
         "preflight_manifest_sha256": preflight_manifest_sha256,
         "candidate_steps": [step for step in ALLOWED_STEPS if step <= max_train_steps],
         "audio_total_weight": AUDIO_TOTAL_WEIGHT,
