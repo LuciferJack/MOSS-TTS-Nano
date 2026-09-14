@@ -175,6 +175,8 @@ def parse_args() -> argparse.Namespace:
         "--joint-formula-pilot", action="store_true",
         help="Enable the fail-closed five-row joint text+codec formula pilot.",
     )
+    parser.add_argument("--joint-formula-prior-report", default="")
+    parser.add_argument("--joint-formula-prior-report-sha256", default="")
     return parser.parse_args()
 
 
@@ -981,6 +983,8 @@ def main() -> None:
         max_train_steps=args.max_train_steps, lora_rank=args.lora_rank,
         model_path=args.model_path, lora_target_modules=args.lora_target_modules,
         lora_modules_to_save=args.lora_modules_to_save,
+        prior_report_path=args.joint_formula_prior_report,
+        prior_report_sha256=args.joint_formula_prior_report_sha256,
     )
     if args.pcgrad:
         validate_behavior_protection(

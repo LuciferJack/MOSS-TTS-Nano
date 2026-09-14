@@ -15,6 +15,16 @@ nonzero because later residual codebooks still carry timbre/detail; enabling onl
 VQ0 would change both objective size and spectral detail allocation. Keep
 `sequence_balanced` EOS, EOS weight 1, learning rate and all decode settings fixed.
 
+If and only if the complete `0.125` candidate report has verdict `content_fail`,
+v2 may change the single variable to `--channelwise-loss-weight 1,0.5`. The
+report path and SHA-256 are mandatory; the trainer rehashes and parses it through
+`--joint-formula-prior-report` and `--joint-formula-prior-report-sha256`.
+The report itself must bind full SHA-256 values for the v1 candidate weights and
+its content-evaluation manifest.
+At total `0.5`, each VQ weight is `0.03125`; normalized contributions are 66.67%
+text, 33.33% acoustic total, and 2.083% per VQ. No intermediate or larger weight
+is accepted, and every other setting remains identical to v1.
+
 Use exactly five scheduled optimizer steps, batch 1, accumulation 1, then stop
 and evaluate. Do not silently add epochs. Early reject immediately on non-finite
 loss, PCGrad dot below `-1e-7`, retained teacher-gradient norm below 5%, any

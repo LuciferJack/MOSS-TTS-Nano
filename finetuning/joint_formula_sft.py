@@ -12,7 +12,7 @@ from typing import Any
 JOINT_ROLE = "authorized_formula_joint_sft"
 JOINT_ROWS = 5
 ACOUSTIC_PROTECT_ROWS = 8
-PILOT_AUDIO_TOTAL_WEIGHT = 0.125
+PILOT_AUDIO_TOTAL_WEIGHTS = (0.125, 0.5)
 PILOT_N_VQ = 16
 GLOBAL_LORA_TARGETS = r"^transformer\.h\.\d+\.(attn\.(c_attn|c_proj)|mlp\.(c_fc|c_proj))$"
 
@@ -70,7 +70,8 @@ def validate_joint_formula_pilot(
     eos_loss_mode: str, channel_weights: list[float], acoustic_weights: list[float],
     schedule: list[str] | None, max_train_steps: int | None, lora_rank: int,
     model_path: str = "", lora_target_modules: str = GLOBAL_LORA_TARGETS,
-    lora_modules_to_save: str = "",
+    lora_modules_to_save: str = "", prior_report_path: str = "",
+    prior_report_sha256: str = "",
 ) -> None:
     selected = validate_joint_formula_rows(rows)
     if not selected:
@@ -93,16 +94,39 @@ def validate_joint_formula_pilot(
         raise ValueError("Joint pilot may train only the global AR attention/MLP LoRA modules.")
     if not channel_weights or channel_weights[0] != 1.0:
         raise ValueError("Joint formula text weight must be exactly 1.")
-    if any(weight <= 0 for weight in channel_weights[1:]) or not math.isclose(
-        sum(channel_weights[1:]), PILOT_AUDIO_TOTAL_WEIGHT, rel_tol=0, abs_tol=1e-12
-    ):
-        raise ValueError("Joint pilot acoustic weight must be total 0.125, evenly nonzero across every VQ layer.")
+    audio_total = sum(channel_weights[1:])
+    allowed_total = next((value for value in PILOT_AUDIO_TOTAL_WEIGHTS
+                          if math.isclose(audio_total, value, rel_tol=0, abs_tol=1e-12)), None)
+    if any(weight <= 0 for weight in channel_weights[1:]) or allowed_total is None:
+        raise ValueError("Joint pilot acoustic total must be exactly 0.125 or 0.5.")
     if len(channel_weights[1:]) != PILOT_N_VQ:
         raise ValueError("Joint formula pilot requires exactly 16 VQ loss heads.")
-    expected = PILOT_AUDIO_TOTAL_WEIGHT / PILOT_N_VQ
+    expected = allowed_total / PILOT_N_VQ
     if any(not math.isclose(weight, expected, rel_tol=0, abs_tol=1e-12)
            for weight in channel_weights[1:]):
         raise ValueError("Joint pilot must weight all VQ layers evenly.")
+    if allowed_total == 0.5:
+        report_path = Path(prior_report_path).expanduser()
+        if not report_path.is_file() or not re.fullmatch(r"[0-9a-f]{64}", prior_report_sha256):
+            raise ValueError("0.5 pilot requires the hashed prior 0.125 content-failure report.")
+        actual_sha = hashlib.sha256(report_path.read_bytes()).hexdigest()
+        if actual_sha != prior_report_sha256:
+            raise ValueError("Prior 0.125 pilot report SHA-256 mismatch.")
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError("Prior pilot report must be valid UTF-8 JSON.") from exc
+        artifact_hashes = (report.get("candidate_weights_sha256", ""),
+                           report.get("content_eval_manifest_sha256", ""))
+        if (
+            report.get("acoustic_total_weight") != 0.125
+            or report.get("verdict") != "content_fail"
+            or not all(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value)
+                       for value in artifact_hashes)
+        ):
+            raise ValueError("0.5 pilot requires a genuine 0.125 content_fail verdict.")
+    elif prior_report_path or prior_report_sha256:
+        raise ValueError("0.125 baseline pilot must not claim a prior failure artifact.")
     if acoustic_weights[0] != 0 or not math.isclose(sum(acoustic_weights[1:]), 1.0):
         raise ValueError("Acoustic protect objective must be 0,1.")
     expected_ids = [row["id"] for row in rows]

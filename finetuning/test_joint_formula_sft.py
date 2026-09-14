@@ -4,6 +4,8 @@ from copy import deepcopy
 import hashlib
 import json
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from finetuning.joint_formula_sft import validate_joint_formula_pilot
 
@@ -67,6 +69,28 @@ class JointFormulaSFTTest(unittest.TestCase):
             train = rows(); mutate(train[0])
             with self.assertRaises(ValueError):
                 validate_joint_formula_pilot(train, [{"id": i} for i in range(8)], **kwargs(train))
+
+    def test_v2_requires_hashed_prior_content_failure(self):
+        train = rows()
+        with TemporaryDirectory() as directory:
+            report = Path(directory) / "prior.json"
+            report.write_text(json.dumps({"acoustic_total_weight": 0.125,
+                                          "verdict": "content_fail",
+                                          "candidate_weights_sha256": "b" * 64,
+                                          "content_eval_manifest_sha256": "c" * 64}), encoding="utf-8")
+            options = kwargs(train)
+            options["channel_weights"] = [1] + [0.5 / 16] * 16
+            options["prior_report_path"] = str(report)
+            options["prior_report_sha256"] = hashlib.sha256(report.read_bytes()).hexdigest()
+            validate_joint_formula_pilot(train, [{"id": i} for i in range(8)], **options)
+            for key, value in (("prior_report_sha256", "0" * 64),
+                               ("prior_report_path", "missing.json")):
+                broken = dict(options); broken[key] = value
+                with self.assertRaises(ValueError):
+                    validate_joint_formula_pilot(train, [{"id": i} for i in range(8)], **broken)
+            arbitrary = dict(options); arbitrary["channel_weights"] = [1] + [0.25 / 16] * 16
+            with self.assertRaisesRegex(ValueError, "0.125 or 0.5"):
+                validate_joint_formula_pilot(train, [{"id": i} for i in range(8)], **arbitrary)
 
 
 if __name__ == "__main__":
