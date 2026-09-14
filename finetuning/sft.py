@@ -38,6 +38,13 @@ from finetuning.eos_calibration import validate_calibration_records
 from finetuning.joint_formula_sft import validate_joint_formula_pilot
 from finetuning.same_speaker_pilot import validate_same_speaker_pilot
 from finetuning.protected_gradient import is_feasible_dot, project_teacher_gradient
+from finetuning.speaker_conditioner import (
+    SpeakerConditioner,
+    attach_speaker_conditioner,
+    embedding_dim,
+    load_speaker_embeddings,
+    resolve_batch_embedding,
+)
 
 DEFAULT_MODEL_PATH = REPO_ROOT / "models" / "MOSS-TTS-Nano"
 DEFAULT_CODEC_PATH = REPO_ROOT / "models" / "MOSS-Audio-Tokenizer-Nano"
@@ -214,6 +221,16 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Per-frame character alignment manifest; required when --content-loss-weight > 0.",
     )
+    parser.add_argument(
+        "--speaker-conditioning",
+        action="store_true",
+        help="Enable the independent CAMPPlus-FiLM speaker conditioner (route B1).",
+    )
+    parser.add_argument(
+        "--speaker-embeddings-jsonl",
+        default="",
+        help="Pinned speaker-embeddings manifest; required when --speaker-conditioning is set.",
+    )
     return parser.parse_args()
 
 
@@ -240,6 +257,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--content-alignment-jsonl is required when --content-loss-weight > 0.")
     if args.content_alignment_jsonl and args.content_loss_weight <= 0:
         raise ValueError("--content-alignment-jsonl requires --content-loss-weight > 0.")
+    if args.speaker_conditioning and not args.speaker_embeddings_jsonl:
+        raise ValueError("--speaker-embeddings-jsonl is required when --speaker-conditioning is set.")
+    if args.speaker_embeddings_jsonl and not args.speaker_conditioning:
+        raise ValueError("--speaker-embeddings-jsonl requires --speaker-conditioning.")
     if args.max_train_steps is not None and args.max_train_steps <= 0:
         raise ValueError("`max_train_steps` must be > 0 when set.")
     if args.max_grad_norm < 0:
@@ -719,13 +740,21 @@ def compute_supervised_loss(
     acoustic_tail_weighted_mask: Optional[torch.BoolTensor] = None,
     return_breakdown: bool = False,
     return_global_hidden: bool = False,
+    speaker_conditioner: Optional["SpeakerConditioner"] = None,
+    speaker_embedding: Optional[torch.Tensor] = None,
 ):
+    if speaker_conditioner is not None:
+        if speaker_embedding is None:
+            raise ValueError("speaker_conditioning requires a batch speaker embedding")
+        speaker_conditioner.begin_batch(speaker_embedding)
     outputs = model(
         input_ids=input_ids,
         attention_mask=attention_mask,
         use_cache=False,
         return_dict=True,
     )
+    if speaker_conditioner is not None:
+        speaker_conditioner.end_batch()
     global_hidden_states = outputs.global_hidden_states
     if global_hidden_states is None:
         raise RuntimeError("Model forward did not return global_hidden_states.")
@@ -914,6 +943,7 @@ def save_checkpoint(
     global_step: int,
     epoch: int,
     content_head=None,
+    speaker_conditioner=None,
 ) -> None:
     accelerator.wait_for_everyone()
     if not accelerator.is_main_process:
@@ -938,6 +968,14 @@ def save_checkpoint(
             )
             metadata["content_head_file"] = head_path.name
             metadata["content_head_sha256"] = hashlib.sha256(head_path.read_bytes()).hexdigest()
+        if speaker_conditioner is not None:
+            conditioner_path = output_dir / "speaker_conditioner.pt"
+            torch.save(
+                {key: value.detach().cpu() for key, value in speaker_conditioner.state_dict().items()},
+                conditioner_path,
+            )
+            metadata["speaker_conditioner_file"] = conditioner_path.name
+            metadata["speaker_conditioner_sha256"] = hashlib.sha256(conditioner_path.read_bytes()).hexdigest()
         with open(output_dir / "finetune_config.json", "w", encoding="utf-8") as handle:
             json.dump(metadata, handle, indent=2, ensure_ascii=False)
         return
@@ -969,6 +1007,14 @@ def save_checkpoint(
         )
         metadata["content_head_file"] = head_path.name
         metadata["content_head_sha256"] = hashlib.sha256(head_path.read_bytes()).hexdigest()
+    if speaker_conditioner is not None:
+        conditioner_path = output_dir / "speaker_conditioner.pt"
+        torch.save(
+            {key: value.detach().cpu() for key, value in speaker_conditioner.state_dict().items()},
+            conditioner_path,
+        )
+        metadata["speaker_conditioner_file"] = conditioner_path.name
+        metadata["speaker_conditioner_sha256"] = hashlib.sha256(conditioner_path.read_bytes()).hexdigest()
     with open(output_dir / "finetune_config.json", "w", encoding="utf-8") as handle:
         json.dump(metadata, handle, indent=2, ensure_ascii=False)
 
@@ -1068,6 +1114,28 @@ def main() -> None:
             vocab=alignment_vocab(content_alignment),
         )
 
+    speaker_embeddings = None
+    speaker_conditioner = None
+    speaker_reference_by_sample = {}
+    if args.speaker_conditioning:
+        speaker_embeddings = load_speaker_embeddings(args.speaker_embeddings_jsonl)
+        base_for_conditioner = model
+        while hasattr(base_for_conditioner, "base_model") and not hasattr(base_for_conditioner, "transformer"):
+            base_for_conditioner = base_for_conditioner.base_model
+        n_layers = len(base_for_conditioner.transformer.h)
+        speaker_conditioner = SpeakerConditioner(
+            embedding_dim=embedding_dim(speaker_embeddings),
+            hidden_size=int(model.config.hidden_size),
+            n_layers=n_layers,
+            film_rank=32,
+        )
+        attach_speaker_conditioner(model, speaker_conditioner)
+        for row in list(records) + list(protect_records):
+            provenance = row.get("reference_provenance") or {}
+            reference_id = provenance.get("id")
+            if reference_id:
+                speaker_reference_by_sample[str(row.get("id", ""))] = str(reference_id)
+
     dataset = MossTTSNanoSFTDataset(
         records,
         tokenizer=tokenizer,
@@ -1109,7 +1177,8 @@ def main() -> None:
             collate_fn=behavior_dataset.collate_fn,
         )
 
-    optimizer = build_optimizer(model, args, extra_modules=[content_head] if content_head is not None else [])
+    extra_train_modules = [module for module in (content_head, speaker_conditioner) if module is not None]
+    optimizer = build_optimizer(model, args, extra_modules=extra_train_modules)
     global_batch_size = (
         args.per_device_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
     )
@@ -1205,6 +1274,12 @@ def main() -> None:
     train_args_to_save["behavior_protect_records_paths"] = [str(path.resolve()) for path in behavior_records_paths]
     train_args_to_save["same_speaker_heldout_records_paths"] = [str(path.resolve()) for path in same_speaker_heldout_paths]
     train_args_to_save["resolved_same_speaker_contract"] = resolved_same_speaker_contract
+    if speaker_embeddings is not None:
+        train_args_to_save["resolved_speaker_conditioning"] = {
+            "embedding_dim": embedding_dim(speaker_embeddings),
+            "reference_ids": sorted(speaker_embeddings),
+            "film_rank": 32,
+        }
     if content_alignment is not None:
         train_args_to_save["resolved_content_alignment"] = {
             sample_id: {
@@ -1244,6 +1319,13 @@ def main() -> None:
         model.train()
         for batch in train_dataloader:
             with accelerator.accumulate(model):
+                speaker_batch_embedding = None
+                if speaker_conditioner is not None:
+                    speaker_batch_embedding = resolve_batch_embedding(
+                        batch["sample_ids"],
+                        reference_id_by_sample=speaker_reference_by_sample,
+                        embeddings=speaker_embeddings,
+                    ).to(batch["input_ids"].device)
                 content_enabled = content_head is not None
                 if content_enabled:
                     loss, channel_losses, global_hidden = compute_supervised_loss(
@@ -1262,6 +1344,8 @@ def main() -> None:
                                                      if args.joint_formula_tail_weighting else None),
                         return_breakdown=True,
                         return_global_hidden=True,
+                        speaker_conditioner=speaker_conditioner,
+                        speaker_embedding=speaker_batch_embedding,
                     )
                 else:
                     loss, channel_losses = compute_supervised_loss(
@@ -1279,6 +1363,8 @@ def main() -> None:
                         acoustic_tail_weighted_mask=(batch.get("acoustic_tail_weighted_mask")
                                                      if args.joint_formula_tail_weighting else None),
                         return_breakdown=True,
+                        speaker_conditioner=speaker_conditioner,
+                        speaker_embedding=speaker_batch_embedding,
                     )
                     global_hidden = None
                 content_metrics = None
@@ -1304,6 +1390,11 @@ def main() -> None:
                             model, input_ids=item["input_ids"], attention_mask=item["attention_mask"],
                             labels=item["labels"], channelwise_loss_weight=protect_channelwise_loss_weight,
                             eos_loss_weight=args.eos_loss_weight, eos_loss_mode=args.eos_loss_mode,
+                            speaker_conditioner=speaker_conditioner,
+                            speaker_embedding=(resolve_batch_embedding(
+                                item["sample_ids"], reference_id_by_sample=speaker_reference_by_sample,
+                                embeddings=speaker_embeddings).to(item["input_ids"].device)
+                                if speaker_conditioner is not None else None),
                         ) for item in acoustic_batches
                     ]
                     protector_loss_factories.extend(
@@ -1311,6 +1402,11 @@ def main() -> None:
                             model, input_ids=item["input_ids"], attention_mask=item["attention_mask"],
                             labels=item["labels"], channelwise_loss_weight=behavior_protect_channelwise_loss_weight,
                             eos_loss_weight=args.eos_loss_weight, eos_loss_mode="sequence_balanced",
+                            speaker_conditioner=speaker_conditioner,
+                            speaker_embedding=(resolve_batch_embedding(
+                                item["sample_ids"], reference_id_by_sample=speaker_reference_by_sample,
+                                embeddings=speaker_embeddings).to(item["input_ids"].device)
+                                if speaker_conditioner is not None else None),
                         ) for item in behavior_batches
                     )
                     projection_report = pcgrad_backward(
@@ -1328,8 +1424,8 @@ def main() -> None:
 
                 if accelerator.sync_gradients and args.max_grad_norm > 0:
                     clip_parameters = list(model.parameters())
-                    if content_head is not None:
-                        clip_parameters.extend(content_head.parameters())
+                    for extra_module in extra_train_modules:
+                        clip_parameters.extend(extra_module.parameters())
                     accelerator.clip_grad_norm_(clip_parameters, args.max_grad_norm)
 
                 if accelerator.sync_gradients:
@@ -1418,6 +1514,7 @@ def main() -> None:
                 global_step=global_step,
                 epoch=epoch + 1,
                 content_head=content_head,
+                speaker_conditioner=speaker_conditioner,
             )
         completed_epochs = epoch + 1
 
@@ -1435,6 +1532,7 @@ def main() -> None:
         global_step=global_step,
         epoch=completed_epochs,
         content_head=content_head,
+        speaker_conditioner=speaker_conditioner,
     )
     accelerator.print(
         f"[{format_timestamp()}] [sft] finished "

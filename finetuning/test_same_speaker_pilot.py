@@ -118,7 +118,8 @@ class SameSpeakerPilotTest(unittest.TestCase):
                     behavior_protect_jsonl="", train_schedule_json="", same_speaker_pilot=True,
                     same_speaker_heldout_jsonl="heldout", same_speaker_preflight_manifest="manifest",
                     same_speaker_preflight_manifest_sha256="a" * 64, joint_formula_pilot=False,
-                    content_loss_weight=0.0, content_alignment_jsonl="")
+                    content_loss_weight=0.0, content_alignment_jsonl="",
+                    speaker_conditioning=False, speaker_embeddings_jsonl="")
         validate_args(SimpleNamespace(**base))
         for changes in ({"per_device_batch_size": 2}, {"save_every_epochs": 2}, {"num_epochs": 3}):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
