@@ -21,10 +21,13 @@ DEFAULT_EMBEDDING_DIM = 512
 
 
 class SpeakerConditioner(nn.Module):
-    """shared MLP (emb->hidden) + per-layer zero-init low-rank FiLM factors.
+    """shared MLP (emb->hidden) + per-layer low-rank FiLM factors.
 
-    Zero initialization makes scale=0/shift=0 at start, so the conditioned
-    model is exactly the base model until training moves the factors.
+    The right factors are zero at init, so the initial FiLM is exactly the
+    identity (scale=0, shift=0) and the conditioned model equals the base
+    model until training moves the factors. Left factors carry small random
+    init so the product parameterization escapes the all-zero gradient
+    deadlock (d scale/d right != 0 at init).
     """
 
     def __init__(self, *, embedding_dim: int, hidden_size: int, n_layers: int, film_rank: int):
@@ -39,9 +42,19 @@ class SpeakerConditioner(nn.Module):
             nn.Linear(self.embedding_dim, self.hidden_size),
             nn.GELU(),
         )
-        self.scale_left = nn.Parameter(torch.zeros(self.n_layers, self.hidden_size, self.film_rank))
+        # Left factors get small random init, right factors stay zero: the
+        # initial FiLM is exactly identity (scale=0, shift=0), but the zero
+        # product (cond @ 0-left) @ 0-right would give both factors zero
+        # gradient at init. With left non-zero, d(scale)/d(right) is non-zero
+        # so training starts immediately (same scheme as LoRA A/B).
+        init_scale = 1.0 / math.sqrt(self.hidden_size)
+        self.scale_left = nn.Parameter(
+            torch.randn(self.n_layers, self.hidden_size, self.film_rank) * init_scale
+        )
         self.scale_right = nn.Parameter(torch.zeros(self.n_layers, self.film_rank, self.hidden_size))
-        self.shift_left = nn.Parameter(torch.zeros(self.n_layers, self.hidden_size, self.film_rank))
+        self.shift_left = nn.Parameter(
+            torch.randn(self.n_layers, self.hidden_size, self.film_rank) * init_scale
+        )
         self.shift_right = nn.Parameter(torch.zeros(self.n_layers, self.film_rank, self.hidden_size))
         self._batch_conditioning: Optional[torch.Tensor] = None
 

@@ -57,6 +57,20 @@ class TestSpeakerConditioner(unittest.TestCase):
             self.assertTrue(torch.all(shift == 0))
         conditioner.end_batch()
 
+    def test_initial_gradient_flows_to_right_factors(self):
+        """At init the right factors must receive non-zero gradient (regression:
+        all-zero factorization deadlocks both factors at zero gradient)."""
+        torch.manual_seed(0)
+        conditioner = SpeakerConditioner(embedding_dim=8, hidden_size=16, n_layers=3, film_rank=4)
+        conditioner.begin_batch(torch.randn(2, 8))
+        scale, shift = conditioner.film(0)
+        loss = (scale.sum() + shift.sum())
+        loss.backward()
+        self.assertGreater(float(conditioner.scale_right.grad.abs().sum()), 0.0)
+        self.assertGreater(float(conditioner.shift_right.grad.abs().sum()), 0.0)
+        self.assertTrue(conditioner.encoder[0].weight.grad is not None)
+        conditioner.end_batch()
+
     def test_dims_validation(self):
         with self.assertRaises(ValueError):
             SpeakerConditioner(embedding_dim=0, hidden_size=16, n_layers=3, film_rank=4)
