@@ -961,10 +961,13 @@ def main() -> None:
     same_speaker_heldout_paths, same_speaker_heldout_records = (
         load_jsonl_spec(args.same_speaker_heldout_jsonl) if args.same_speaker_pilot else ([], [])
     )
-    if train_schedule and args.max_train_steps != len(train_schedule):
+    if train_schedule and (
+        args.max_train_steps < len(train_schedule)
+        or args.max_train_steps % len(train_schedule) != 0
+    ):
         raise ValueError(
-            "Scheduled training requires max_train_steps to equal the schedule length "
-            f"({len(train_schedule)}), got {args.max_train_steps}."
+            "Scheduled training requires max_train_steps to be a positive multiple of the "
+            f"schedule length ({len(train_schedule)}), got {args.max_train_steps}."
         )
 
     validate_round2_model_baseline(
